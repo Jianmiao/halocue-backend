@@ -15,11 +15,16 @@
 **/venv/
 
 # Local application state and generated outputs.
-**/data/
-**/artifacts/
-**/workspace/
-**/dist/
-**/build/
+/08-HaloCue-1.0/data/
+/09-HaloCue-1.0-Writing/data/
+/10-HaloCue-1.0-Integrated/data/
+/08-HaloCue-1.0/dist/
+/08-HaloCue-1.0/build/
+/09-HaloCue-1.0-Writing/dist/
+/09-HaloCue-1.0-Writing/build/
+/10-HaloCue-1.0-Integrated/dist/
+/10-HaloCue-1.0-Integrated/build/
+**/*.egg-info/
 *.log
 
 # Local credentials and overrides.
