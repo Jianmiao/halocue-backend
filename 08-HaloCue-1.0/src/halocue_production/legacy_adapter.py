@@ -8,11 +8,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
+import time
 import mimetypes
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import Settings
 from . import cg_advice, cg_segments
@@ -1702,6 +1704,198 @@ class Legacy093Adapter:
             finally:
                 build_bundle.compile_script = original_compile
                 script2aap.HERE = original_here
+
+    def execute_compile_cancellable(
+        self,
+        token: str,
+        build_id: str,
+        *,
+        cancellation_probe: Callable[[], bool],
+    ) -> dict[str, Any]:
+        worker_dir = self.settings.data_dir / "runtime-workers"
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        result_path = worker_dir / f"{new_id('compile-worker')}.json"
+        src_root = Path(__file__).resolve().parents[1]
+        allowed_environment = {
+            "APPDATA",
+            "COMSPEC",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LOCALAPPDATA",
+            "PATH",
+            "PATHEXT",
+            "PROGRAMDATA",
+            "PYTHONIOENCODING",
+            "PYTHONUTF8",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "USER",
+            "USERNAME",
+            "VIRTUAL_ENV",
+            "WINDIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        }
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in allowed_environment
+        }
+        environment["PYTHONPATH"] = str(src_root)
+        environment["HALOCUE_USER_DATA_DIR"] = str(self.compat_root)
+        command = [
+            sys.executable,
+            "-m",
+            "halocue_production.compile_worker",
+            "--project-root",
+            str(self.settings.project_root),
+            "--data-dir",
+            str(self.settings.data_dir),
+            "--legacy-root",
+            str(self.settings.legacy_root),
+            "--resource-index",
+            str(self.settings.resource_index or ""),
+            "--aa-data",
+            str(self.settings.aa_data or ""),
+            "--name-baseline",
+            str(self.settings.name_baseline or ""),
+            "--token",
+            token,
+            "--build-id",
+            build_id,
+            "--parent-pid",
+            str(os.getpid()),
+            "--result",
+            str(result_path),
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=str(self.settings.project_root),
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            while process.poll() is None:
+                if cancellation_probe():
+                    self._terminate_compile_worker(process)
+                    self.discard_compile_output(token, build_id)
+                    raise ProductionError(
+                        "operation_cancelled", "AA 编译已取消", status=409
+                    )
+                time.sleep(0.05)
+            if cancellation_probe():
+                self.discard_compile_output(token, build_id)
+                raise ProductionError(
+                    "operation_cancelled", "AA 编译已取消", status=409
+                )
+            if process.returncode != 0 or not result_path.is_file():
+                raise ProductionError(
+                    "compile_worker_failed", "AA 编译子进程异常退出", status=500
+                )
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ProductionError(
+                    "compile_worker_result_invalid",
+                    "AA 编译子进程返回了无效结果",
+                    status=500,
+                ) from exc
+            if payload.get("ok") is True and isinstance(payload.get("result"), dict):
+                return payload["result"]
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            raise ProductionError(
+                str(error.get("code") or "compile_worker_failed"),
+                str(error.get("message") or "AA 编译子进程失败"),
+                status=int(error.get("status") or 500),
+                details=(error.get("details") if isinstance(error.get("details"), dict) else {}),
+            )
+        finally:
+            if process.poll() is None:
+                self._terminate_compile_worker(process)
+            result_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _terminate_compile_worker(process: subprocess.Popen) -> None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    def discard_compile_output(self, token: str, build_id: str) -> None:
+        draft_dir = Path(self.store.get_draft_path(token))
+        data_root = self.settings.data_dir.resolve()
+        drafts_dir = self.settings.data_dir / "drafts"
+        drafts_root = drafts_dir.resolve()
+        draft_root = draft_dir.resolve()
+        builds_dir = draft_dir / "builds"
+        builds_root = builds_dir.resolve()
+
+        def invalid_path() -> None:
+            raise ProductionError(
+                "compile_cleanup_path_invalid",
+                "取消编译的清理路径越过草稿构建目录",
+                status=500,
+            )
+
+        if (
+            not re.fullmatch(r"build-[0-9a-f]{12}", str(build_id))
+            or not drafts_root.is_relative_to(data_root)
+            or drafts_dir.is_symlink()
+            or drafts_root.parent != data_root
+            or draft_dir.is_symlink()
+            or draft_root.parent != drafts_root
+            or builds_dir.is_symlink()
+            or builds_root.parent != draft_root
+        ):
+            invalid_path()
+
+        def remove(candidate: Path) -> None:
+            current = candidate
+            while current != builds_dir:
+                if current.is_symlink():
+                    invalid_path()
+                current = current.parent
+            if not candidate.exists():
+                return
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(builds_root):
+                invalid_path()
+            shutil.rmtree(resolved)
+
+        remove(builds_dir / ".tmp" / build_id)
+        if builds_dir.is_dir():
+            for revision_dir in builds_dir.iterdir():
+                if revision_dir.name == ".tmp" or not revision_dir.is_dir():
+                    continue
+                remove(revision_dir / build_id)
+        with self.store.draft_lock(token):
+            session_path = draft_dir / "session.json"
+            if not session_path.is_file():
+                return
+            try:
+                session = json.loads(session_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return
+            if session.get("last_compiled_build_id") != build_id:
+                return
+            session.pop("last_compiled_build_id", None)
+            session.pop("last_compiled_content_revision", None)
+            temporary = session_path.with_suffix(".json.cancel.tmp")
+            temporary.write_text(
+                json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temporary, session_path)
 
     def _inject_task_assets_into_bundle(self, *, token: str, bundle_dir: Path) -> None:
         """Attach task-owned custom files after legacy compilation, before install validation."""

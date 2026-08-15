@@ -102,6 +102,7 @@ class JobRecord:
 
 Task = Callable[..., dict[str, Any] | JobOutcome]
 FailureHandler = Callable[[Exception], None]
+CancelHandler = Callable[[], None]
 
 
 class JobRegistry:
@@ -116,6 +117,7 @@ class JobRegistry:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="halocue")
         self._futures: dict[str, Future] = {}
         self._tokens: dict[str, CancellationToken] = {}
+        self._cancel_handlers: dict[str, CancelHandler] = {}
         self._lock = threading.RLock()
         self._commit_lock = threading.RLock()
         if isinstance(base_dir, RuntimeStore):
@@ -201,9 +203,12 @@ class JobRegistry:
         task: Task,
         token: CancellationToken,
         on_failure: FailureHandler | None,
+        on_cancel: CancelHandler | None,
     ) -> dict[str, Any] | None:
         attempt_id = str(record.attempt_id)
         if not self._runtime.start_attempt(attempt_id):
+            if token.is_cancelled():
+                self._run_cancel_handler(on_cancel)
             return None
         try:
             token.raise_if_cancelled()
@@ -211,8 +216,12 @@ class JobRegistry:
             token.raise_if_cancelled()
         except JobCancelled:
             self._runtime.cancel_attempt(attempt_id)
+            self._run_cancel_handler(on_cancel)
             return None
         except Exception as exc:
+            if token.is_cancelled():
+                self._run_cancel_handler(on_cancel)
+                return None
             self._fail_attempt(attempt_id, token, exc, on_failure)
             return None
         outcome = result if isinstance(result, JobOutcome) else JobOutcome(result)
@@ -222,6 +231,7 @@ class JobRegistry:
             return None
         with self._commit_lock:
             if token.is_cancelled():
+                self._run_cancel_handler(on_cancel)
                 return None
             try:
                 if outcome.commit is not None:
@@ -232,6 +242,15 @@ class JobRegistry:
             if not self._runtime.succeed_attempt(attempt_id, outcome.result):
                 return None
         return outcome.result
+
+    @staticmethod
+    def _run_cancel_handler(handler: CancelHandler | None) -> None:
+        if handler is None:
+            return
+        try:
+            handler()
+        except (OSError, ProductionError):
+            return
 
     def submit(
         self,
@@ -244,6 +263,7 @@ class JobRegistry:
         provider: str | None = None,
         model_or_engine: str | None = None,
         on_failure: FailureHandler | None = None,
+        on_cancel: CancelHandler | None = None,
     ) -> JobRecord:
         record = self._create_record(
             kind,
@@ -257,11 +277,26 @@ class JobRegistry:
         token = CancellationToken(self._runtime, str(record.attempt_id), event)
         with self._lock:
             self._tokens[record.job_id] = token
+            if on_cancel is not None:
+                self._cancel_handlers[record.job_id] = on_cancel
             future = self._executor.submit(
-                self._execute, record, task, token, on_failure
+                self._execute, record, task, token, on_failure, on_cancel
             )
             self._futures[record.job_id] = future
+            future.add_done_callback(
+                lambda completed, job_id=record.job_id: self._forget_control(
+                    job_id, completed
+                )
+            )
         return record
+
+    def _forget_control(self, job_id: str, future: Future) -> None:
+        with self._lock:
+            if self._futures.get(job_id) is not future:
+                return
+            self._futures.pop(job_id, None)
+            self._tokens.pop(job_id, None)
+            self._cancel_handlers.pop(job_id, None)
 
     def run_sync(
         self,
@@ -274,6 +309,7 @@ class JobRegistry:
         provider: str | None = None,
         model_or_engine: str | None = None,
         on_failure: FailureHandler | None = None,
+        on_cancel: CancelHandler | None = None,
     ) -> tuple[JobRecord, dict[str, Any]]:
         record = self._create_record(
             kind,
@@ -287,7 +323,14 @@ class JobRegistry:
         token = CancellationToken(self._runtime, str(record.attempt_id), event)
         with self._lock:
             self._tokens[record.job_id] = token
-        result = self._execute(record, task, token, on_failure)
+            if on_cancel is not None:
+                self._cancel_handlers[record.job_id] = on_cancel
+        try:
+            result = self._execute(record, task, token, on_failure, on_cancel)
+        finally:
+            with self._lock:
+                self._tokens.pop(record.job_id, None)
+                self._cancel_handlers.pop(record.job_id, None)
         if result is None:
             completed = self.get(record.job_id)
             if completed and completed.state == "failed" and completed.error:
@@ -310,11 +353,12 @@ class JobRegistry:
                     return False
                 token = self._tokens.get(job_id)
                 future = self._futures.get(job_id)
+                cancel_handler = self._cancel_handlers.get(job_id)
                 if token is not None:
                     token.cancel()
                 cancelled = self._runtime.cancel_attempt(str(record.attempt_id))
-                if cancelled and future is not None:
-                    future.cancel()
+                if cancelled and future is not None and future.cancel():
+                    self._run_cancel_handler(cancel_handler)
                 return cancelled
 
     def get(self, job_id: str) -> JobRecord | None:
@@ -331,5 +375,12 @@ class JobRegistry:
             with self._commit_lock:
                 for token in self._tokens.values():
                     token.cancel()
+                active = [
+                    (job_id, future, self._cancel_handlers.get(job_id))
+                    for job_id, future in self._futures.items()
+                ]
+                for job_id, future, cancel_handler in active:
+                    if future.cancel():
+                        self._run_cancel_handler(cancel_handler)
                 self._executor.shutdown(wait=False, cancel_futures=True)
                 self._runtime.abandon_active_attempts()

@@ -7,7 +7,7 @@ from typing import Any
 
 from .config import Settings
 from .errors import ProductionError
-from .direction_models import DirectionModelGateway
+from .direction_models import CancellableModelProvider, DirectionModelGateway
 from .jobs import CancellationToken, JobOutcome, JobRegistry
 from .legacy_adapter import Legacy093Adapter
 from .models import ProductionRun, ScriptRelease, WorkItem, content_sha256, new_id, utc_now
@@ -65,7 +65,21 @@ class ProductionService:
         )
         self.jobs = JobRegistry(settings.data_dir / "jobs", runtime=self.repository.runtime)
         self.asset_staging = AssetStaging(settings.data_dir / "uploads")
+        self._cleanup_abandoned_compile_outputs()
         self._recover_interrupted_runs()
+
+    def _cleanup_abandoned_compile_outputs(self) -> None:
+        for job in self.jobs.list():
+            if job.kind != "compile" or job.state != "abandoned" or not job.run_id:
+                continue
+            build_id = str(job.retry_context.get("build_id") or "")
+            if not BUILD_ID.fullmatch(build_id):
+                continue
+            try:
+                run = self.repository.get_run(job.run_id)
+                self.adapter.discard_compile_output(str(run.draft_token), build_id)
+            except (OSError, ProductionError):
+                continue
 
     def _recover_interrupted_runs(self) -> None:
         for run in self.repository.list_runs():
@@ -252,7 +266,8 @@ class ProductionService:
         def work(token: CancellationToken) -> dict[str, Any]:
             token.raise_if_cancelled()
             result = self.adapter.execute_cg_advice(
-                token=str(run.draft_token), provider=provider,
+                token=str(run.draft_token),
+                provider=CancellableModelProvider(provider, token.is_cancelled),
                 start_card_id=start_card_id, end_card_id=end_card_id,
             )
             token.raise_if_cancelled()
@@ -282,7 +297,7 @@ class ProductionService:
     def test_direction_model(self, *, work_item_id: str | None = None) -> tuple[int, dict[str, Any]]:
         def work(token: CancellationToken) -> dict[str, Any]:
             token.raise_if_cancelled()
-            result = self.direction_models.test_connection()
+            result = self.direction_models.test_connection(token.is_cancelled)
             token.raise_if_cancelled()
             return result
 
@@ -352,7 +367,7 @@ class ProductionService:
             result = self.adapter.execute_direction_generation(
                 token=str(run.draft_token),
                 generation_id=generation_id,
-                provider=provider,
+                provider=CancellableModelProvider(provider, token.is_cancelled),
                 expected_draft_version=expected,
                 story_type=story_type,
             )
@@ -728,7 +743,9 @@ class ProductionService:
         def work(token: CancellationToken) -> dict[str, Any]:
             token.raise_if_cancelled()
             result = self.adapter.execute_ai_preflight(
-                token=str(run.draft_token), preflight_id=preflight_id, provider=provider
+                token=str(run.draft_token),
+                preflight_id=preflight_id,
+                provider=CancellableModelProvider(provider, token.is_cancelled),
             )
             token.raise_if_cancelled()
             return {
@@ -1348,7 +1365,17 @@ class ProductionService:
 
         def work(token: CancellationToken) -> JobOutcome:
             token.raise_if_cancelled()
-            result = self.adapter.execute_compile(str(run.draft_token), build_id)
+            try:
+                result = self.adapter.execute_compile_cancellable(
+                    str(run.draft_token),
+                    build_id,
+                    cancellation_probe=token.is_cancelled,
+                )
+            finally:
+                if token.is_cancelled():
+                    self.adapter.discard_compile_output(
+                        str(run.draft_token), build_id
+                    )
             token.raise_if_cancelled()
             return JobOutcome(
                 {"run_id": run_id, "build_id": build_id, "bundle": result},
@@ -1359,10 +1386,16 @@ class ProductionService:
             "compile",
             work,
             run_id=run_id,
-            retry_context={"expected_draft_version": expected},
+            retry_context={
+                "expected_draft_version": expected,
+                "build_id": build_id,
+            },
             work_item_id=work_item_id,
             model_or_engine="azurearchive-0.9.3",
             on_failure=commit_failure,
+            on_cancel=lambda: self.adapter.discard_compile_output(
+                str(run.draft_token), build_id
+            ),
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict()), "build_id": build_id}
 
