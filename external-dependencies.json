@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "dependencies": [
+    {
+      "id": "aa-compat-local",
+      "source_type": "local-only",
+      "version_coordinate": "handoff-aa-compat/2026-08-15",
+      "default_local_path": "01-完整程序/aa",
+      "environment_override": "HALOCUE_LEGACY_ROOT",
+      "required_for": [
+        "aa_compatibility_tests",
+        "aap_compile",
+        "aa_local_preflight"
+      ],
+      "verification": {
+        "kind": "handoff_manifest_subset",
+        "entry_count": 76,
+        "content_hash": "sha256:67d6d1f093cc1d07d5922e1add1020caf49a7a2ffb3b8ca0bd3db644897dbc9f"
+      },
+      "repository_policy": "do_not_commit_or_distribute",
+      "license_status": "unverified"
+    }
+  ]
+}
