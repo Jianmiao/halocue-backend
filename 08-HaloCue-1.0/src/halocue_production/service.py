@@ -8,7 +8,7 @@ from typing import Any
 from .config import Settings
 from .errors import ProductionError
 from .direction_models import DirectionModelGateway
-from .jobs import JobRegistry
+from .jobs import CancellationToken, JobOutcome, JobRegistry
 from .legacy_adapter import Legacy093Adapter
 from .models import ProductionRun, ScriptRelease, WorkItem, content_sha256, new_id, utc_now
 from .model_settings import DirectionModelSettings
@@ -63,7 +63,7 @@ class ProductionService:
         self.direction_models = DirectionModelGateway(
             self.direction_model_settings, settings.legacy_root
         )
-        self.jobs = JobRegistry(settings.data_dir / "jobs")
+        self.jobs = JobRegistry(settings.data_dir / "jobs", runtime=self.repository.runtime)
         self.asset_staging = AssetStaging(settings.data_dir / "uploads")
         self._recover_interrupted_runs()
 
@@ -229,7 +229,13 @@ class ProductionService:
     def direction_model_settings_public(self) -> dict[str, Any]:
         return self.direction_model_settings.public()
 
-    def request_cg_advice(self, run_id: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def request_cg_advice(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        work_item_id: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
         if not self.direction_model_settings.public()["model"]["configured"]:
             raise ProductionError(
                 "cg_advice_not_configured", "获取 AI 制作意见前，请先配置演出模型", status=409
@@ -243,11 +249,14 @@ class ProductionService:
         end_card_id = str(payload.get("end_card_id") or "").strip()
         provider = self.direction_models.provider()
 
-        def work() -> dict[str, Any]:
-            return self.adapter.execute_cg_advice(
+        def work(token: CancellationToken) -> dict[str, Any]:
+            token.raise_if_cancelled()
+            result = self.adapter.execute_cg_advice(
                 token=str(run.draft_token), provider=provider,
                 start_card_id=start_card_id, end_card_id=end_card_id,
             )
+            token.raise_if_cancelled()
+            return result
 
         job = self.jobs.submit(
             "cg_advice",
@@ -258,6 +267,9 @@ class ProductionService:
                 "start_card_id": start_card_id,
                 "end_card_id": end_card_id,
             },
+            work_item_id=work_item_id,
+            provider=str(self.direction_model_settings.public()["model"].get("provider") or "") or None,
+            model_or_engine=str(self.direction_model_settings.public()["model"].get("model") or "") or None,
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict())}
 
@@ -267,14 +279,26 @@ class ProductionService:
     def fetch_direction_models(self, payload: dict[str, Any] | None = None) -> list[str]:
         return self.direction_model_settings.fetch_models(payload)
 
-    def test_direction_model(self) -> tuple[int, dict[str, Any]]:
+    def test_direction_model(self, *, work_item_id: str | None = None) -> tuple[int, dict[str, Any]]:
+        def work(token: CancellationToken) -> dict[str, Any]:
+            token.raise_if_cancelled()
+            result = self.direction_models.test_connection()
+            token.raise_if_cancelled()
+            return result
+
+        model = self.direction_model_settings.public()["model"]
         job = self.jobs.submit(
-            "model_connection_test", self.direction_models.test_connection, retry_context={}
+            "model_connection_test",
+            work,
+            retry_context={},
+            work_item_id=work_item_id,
+            provider=str(model.get("provider") or "") or None,
+            model_or_engine=str(model.get("model") or "") or None,
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict())}
 
     def generate_direction(
-        self, run_id: str, payload: dict[str, Any]
+        self, run_id: str, payload: dict[str, Any], *, work_item_id: str | None = None
     ) -> tuple[int, dict[str, Any]]:
         run = self._run(run_id)
         if run.source_summary.get("generation_mode") != "ai_direction":
@@ -310,33 +334,40 @@ class ProductionService:
         run.updated_at = utc_now()
         self.repository.save_run(run)
 
-        def work() -> dict[str, Any]:
-            try:
-                result = self.adapter.execute_direction_generation(
-                    token=str(run.draft_token),
-                    generation_id=generation_id,
-                    provider=provider,
-                    expected_draft_version=expected,
-                    story_type=story_type,
-                )
-            except Exception:
-                latest = self._run(run_id)
-                latest.state = "direction_failed"
-                latest.updated_at = utc_now()
-                self.repository.save_run(latest)
-                raise
+        def commit_success() -> None:
             latest = self._run(run_id)
             latest.state = "waiting_for_review"
             latest.current_stage = "review_install"
             latest.updated_at = utc_now()
             self.repository.save_run(latest)
-            return {"run_id": run_id, **result}
+
+        def commit_failure(_exc: Exception) -> None:
+            latest = self._run(run_id)
+            latest.state = "direction_failed"
+            latest.updated_at = utc_now()
+            self.repository.save_run(latest)
+
+        def work(token: CancellationToken) -> JobOutcome:
+            token.raise_if_cancelled()
+            result = self.adapter.execute_direction_generation(
+                token=str(run.draft_token),
+                generation_id=generation_id,
+                provider=provider,
+                expected_draft_version=expected,
+                story_type=story_type,
+            )
+            token.raise_if_cancelled()
+            return JobOutcome({"run_id": run_id, **result}, commit_success)
 
         job = self.jobs.submit(
             "direction_generation",
             work,
             run_id=run_id,
             retry_context={"expected_draft_version": expected, "story_type": story_type},
+            work_item_id=work_item_id,
+            provider=str(self.direction_model_settings.public()["model"].get("provider") or "") or None,
+            model_or_engine=str(self.direction_model_settings.public()["model"].get("model") or "") or None,
+            on_failure=commit_failure,
         )
         return 202, {
             "ok": True,
@@ -680,7 +711,9 @@ class ProductionService:
             no_argument_commands=set(NO_ARGUMENT_DIRECTIVES),
         )
 
-    def start_ai_preflight(self, run_id: str) -> tuple[int, dict[str, Any]]:
+    def start_ai_preflight(
+        self, run_id: str, *, work_item_id: str | None = None
+    ) -> tuple[int, dict[str, Any]]:
         """Submit a source-only AI review without changing any production state."""
         run = self._run(run_id)
         if not self.direction_model_settings.public()["model"]["configured"]:
@@ -692,10 +725,12 @@ class ProductionService:
         preflight_id = new_id("preflight")
         provider = self.direction_models.provider()
 
-        def work() -> dict[str, Any]:
+        def work(token: CancellationToken) -> dict[str, Any]:
+            token.raise_if_cancelled()
             result = self.adapter.execute_ai_preflight(
                 token=str(run.draft_token), preflight_id=preflight_id, provider=provider
             )
+            token.raise_if_cancelled()
             return {
                 "run_id": run_id,
                 "preflight_id": preflight_id,
@@ -703,7 +738,16 @@ class ProductionService:
                 "ambiguity_count": len(result["analysis"]["ambiguities"]),
             }
 
-        job = self.jobs.submit("ai_preflight", work, run_id=run_id, retry_context={})
+        model = self.direction_model_settings.public()["model"]
+        job = self.jobs.submit(
+            "ai_preflight",
+            work,
+            run_id=run_id,
+            retry_context={},
+            work_item_id=work_item_id,
+            provider=str(model.get("provider") or "") or None,
+            model_or_engine=str(model.get("model") or "") or None,
+        )
         return 202, {"ok": True, "job": self._job_public(job.to_dict()), "preflight_id": preflight_id}
 
     def ai_preflights(self, run_id: str) -> dict[str, Any]:
@@ -1268,7 +1312,13 @@ class ProductionService:
         run = self._run(run_id)
         return self.adapter.validate(str(run.draft_token))
 
-    def compile(self, run_id: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def compile(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        work_item_id: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
         run = self._run(run_id)
         try:
             expected = int(payload["expected_draft_version"])
@@ -1281,30 +1331,38 @@ class ProductionService:
         run.updated_at = utc_now()
         self.repository.save_run(run)
 
-        def work() -> dict[str, Any]:
-            try:
-                result = self.adapter.execute_compile(str(run.draft_token), build_id)
-            except Exception:
-                latest = self._run(run_id)
-                latest.state = "compile_failed"
-                latest.pending_build_id = None
-                latest.updated_at = utc_now()
-                self.repository.save_run(latest)
-                raise
-            else:
-                latest = self._run(run_id)
-                latest.state = "compiled"
-                latest.pending_build_id = None
-                latest.last_build_id = build_id
-                latest.updated_at = utc_now()
-                self.repository.save_run(latest)
-                return {"run_id": run_id, "build_id": build_id, "bundle": result}
+        def commit_success() -> None:
+            latest = self._run(run_id)
+            latest.state = "compiled"
+            latest.pending_build_id = None
+            latest.last_build_id = build_id
+            latest.updated_at = utc_now()
+            self.repository.save_run(latest)
+
+        def commit_failure(_exc: Exception) -> None:
+            latest = self._run(run_id)
+            latest.state = "compile_failed"
+            latest.pending_build_id = None
+            latest.updated_at = utc_now()
+            self.repository.save_run(latest)
+
+        def work(token: CancellationToken) -> JobOutcome:
+            token.raise_if_cancelled()
+            result = self.adapter.execute_compile(str(run.draft_token), build_id)
+            token.raise_if_cancelled()
+            return JobOutcome(
+                {"run_id": run_id, "build_id": build_id, "bundle": result},
+                commit_success,
+            )
 
         job = self.jobs.submit(
             "compile",
             work,
             run_id=run_id,
             retry_context={"expected_draft_version": expected},
+            work_item_id=work_item_id,
+            model_or_engine="azurearchive-0.9.3",
+            on_failure=commit_failure,
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict()), "build_id": build_id}
 
@@ -1321,21 +1379,29 @@ class ProductionService:
         if not self.jobs.cancel(job_id):
             raise ProductionError(
                 "job_not_cancellable",
-                "只能取消尚未开始的排队任务；运行中的任务不会被强制终止",
+                "只能取消排队中或运行中的任务",
                 status=409,
                 details={"state": job.state},
             )
-        return {"ok": True, "job": self._job_public(job.to_dict())}
+        if job.run_id and job.kind in {"compile", "direction_generation"}:
+            run = self._run(job.run_id)
+            run.state = "cancelled"
+            if job.kind == "compile":
+                run.pending_build_id = None
+            run.updated_at = utc_now()
+            self.repository.save_run(run)
+        cancelled = self.jobs.get(job_id)
+        return {"ok": True, "job": self._job_public((cancelled or job).to_dict())}
 
     def retry_job(self, job_id: str) -> dict[str, Any]:
         """Resubmit a failed stage using only persisted, non-sensitive inputs."""
         job = self.jobs.get(job_id)
         if not job:
             raise ProductionError("job_not_found", "后台任务不存在", status=404)
-        if job.state not in {"failed", "interrupted"}:
+        if job.state not in {"failed", "abandoned", "interrupted"}:
             raise ProductionError(
                 "job_not_retryable",
-                "只能重新提交已失败或服务重启中断的任务",
+                "只能重新提交已失败或服务重启后放弃的任务",
                 status=409,
                 details={"state": job.state},
             )
@@ -1344,9 +1410,9 @@ class ProductionService:
         kind = job.kind
         run_id = job.run_id
         if kind == "model_connection_test":
-            _, response = self.test_direction_model()
+            _, response = self.test_direction_model(work_item_id=job.work_item_id)
         elif kind == "ai_preflight" and run_id:
-            _, response = self.start_ai_preflight(run_id)
+            _, response = self.start_ai_preflight(run_id, work_item_id=job.work_item_id)
         elif kind in {"cg_advice", "direction_generation", "compile"} and run_id:
             if "expected_draft_version" not in context:
                 raise ProductionError(
@@ -1377,12 +1443,18 @@ class ProductionService:
                     start_card_id=str(context.get("start_card_id") or ""),
                     end_card_id=str(context.get("end_card_id") or ""),
                 )
-                _, response = self.request_cg_advice(run_id, payload)
+                _, response = self.request_cg_advice(
+                    run_id, payload, work_item_id=job.work_item_id
+                )
             elif kind == "direction_generation":
                 payload["story_type"] = str(context.get("story_type") or "auto")
-                _, response = self.generate_direction(run_id, payload)
+                _, response = self.generate_direction(
+                    run_id, payload, work_item_id=job.work_item_id
+                )
             else:
-                _, response = self.compile(run_id, payload)
+                _, response = self.compile(
+                    run_id, payload, work_item_id=job.work_item_id
+                )
         else:
             raise ProductionError(
                 "job_retry_unavailable",
@@ -1401,7 +1473,7 @@ class ProductionService:
         kind = str(job.get("kind") or "")
         state = str(job.get("state") or "")
         retry_context = job.get("retry_context") if isinstance(job.get("retry_context"), dict) else {}
-        retryable = state in {"failed", "interrupted"} and (
+        retryable = state in {"failed", "abandoned", "interrupted"} and (
             kind == "model_connection_test"
             or (kind == "ai_preflight" and bool(job.get("run_id")))
             or (
@@ -1424,8 +1496,8 @@ class ProductionService:
         if state == "succeeded":
             next_action = {"label": "已完成", "detail": "结果已写回关联任务。", "stage": None}
         elif state == "cancelled":
-            next_action = {"label": "已取消", "detail": "任务尚未开始，未写入任何结果。", "stage": None}
-        elif state in {"failed", "interrupted"}:
+            next_action = {"label": "已取消", "detail": "已阻止该次任务提交结果。", "stage": None}
+        elif state in {"failed", "abandoned", "interrupted"}:
             stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation"} else None
             next_action = {
                 "label": "查看失败原因并回到任务处理",
@@ -1515,9 +1587,33 @@ class ProductionService:
         run, selected = self._installable_build(
             run_id, str(payload.get("build_id") or "") or None
         )
-        return self.adapter.check_install_target(
-            token=str(run.draft_token),
-            build_id=selected,
-            category=str(payload.get("category") or ""),
-            story_name=(str(payload["story_name"]) if payload.get("story_name") is not None else None),
+        category = str(payload.get("category") or "")
+        story_name = (
+            str(payload["story_name"])
+            if payload.get("story_name") is not None
+            else None
         )
+
+        def work(token: CancellationToken) -> dict[str, Any]:
+            token.raise_if_cancelled()
+            result = self.adapter.check_install_target(
+                token=str(run.draft_token),
+                build_id=selected,
+                category=category,
+                story_name=story_name,
+            )
+            token.raise_if_cancelled()
+            return result
+
+        _, result = self.jobs.run_sync(
+            "install_preflight",
+            work,
+            run_id=run_id,
+            retry_context={
+                "build_id": selected,
+                "category": category,
+                "story_name": story_name,
+            },
+            model_or_engine="azurearchive-0.9.3",
+        )
+        return result

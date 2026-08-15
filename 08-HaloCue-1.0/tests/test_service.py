@@ -5,6 +5,7 @@ import hashlib
 import os
 import time
 import threading
+import uuid
 from pathlib import Path
 
 import pytest
@@ -825,6 +826,9 @@ def test_failed_ai_preflight_can_be_resubmitted_without_replacing_history(settin
         time.sleep(0.01)
     assert retry and retry.state == "succeeded"
     assert service.jobs.get(original_id).state == "failed"
+    assert retry.work_item_id == original.work_item_id
+    assert retry.attempt_id != original.attempt_id
+    assert retry.ordinal == 2
     assert len(service.ai_preflights(created["run"]["run_id"])["items"]) == 1
     service.jobs.close()
 
@@ -1294,8 +1298,8 @@ def test_job_registry_persists_completed_and_interrupted_jobs(tmp_path):
     restored = JobRegistry(jobs_dir)
     assert restored.get(completed.job_id).state == "succeeded"
     recovered = restored.get(interrupted.job_id)
-    assert recovered.state == "interrupted"
-    assert recovered.error["code"] == "job_interrupted"
+    assert recovered.state == "abandoned"
+    assert recovered.error["code"] == "attempt_abandoned"
     assert restored.list()[0].job_id == interrupted.job_id
     restored.close()
 
@@ -1608,6 +1612,13 @@ def test_real_compile_and_install_use_isolated_workspace(settings, tmp_path):
         "available": False,
         "conflict": True,
     }
+    install_preflight = next(
+        job for job in service.jobs.list() if job.kind == "install_preflight"
+    )
+    assert install_preflight.state == "succeeded"
+    assert install_preflight.run_id == run_id
+    assert uuid.UUID(str(install_preflight.attempt_id))
+    assert uuid.UUID(str(install_preflight.work_item_id))
 
     installed = service.install(
         run_id,
@@ -2080,14 +2091,16 @@ def test_aa_environment_can_inspect_and_adopt_data_workspace(settings, tmp_path)
     service.jobs.close()
 
 
-def test_job_registry_cancels_only_queued_jobs(tmp_path):
+def test_job_registry_cancels_queued_and_running_jobs(tmp_path):
     registry = JobRegistry(tmp_path / "jobs")
     started = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
 
     def blocking_job():
         started.set()
         release.wait(timeout=3)
+        finished.set()
         return {"ok": True}
 
     running = registry.submit("blocking", blocking_job)
@@ -2095,6 +2108,52 @@ def test_job_registry_cancels_only_queued_jobs(tmp_path):
     queued = registry.submit("queued", lambda: {"ok": True})
     assert registry.cancel(queued.job_id) is True
     assert registry.get(queued.job_id).state == "cancelled"
-    assert registry.cancel(running.job_id) is False
+    assert registry.cancel(running.job_id) is True
+    assert registry.get(running.job_id).state == "cancelled"
     release.set()
+    assert finished.wait(timeout=2)
+    assert registry.get(running.job_id).result is None
     registry.close()
+
+
+def test_cancelled_compile_cannot_register_late_build(settings):
+    service = ProductionService(settings)
+    created = service.create_run(
+        {"project": "取消编译", "source": {"kind": "inline", "text": "旁白: 测试\n"}}
+    )
+    run_id = created["run"]["run_id"]
+    draft_version = created["draft"]["draft_version"]
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    build_id = "build-000000000001"
+
+    service.adapter.create_compile_snapshot = lambda _token, _expected: build_id
+
+    def late_compile(_token, _build_id):
+        started.set()
+        release.wait(timeout=3)
+        finished.set()
+        return {"build_id": build_id, "bundle_dir": "workspace://late-build"}
+
+    service.adapter.execute_compile = late_compile
+    _, accepted = service.compile(
+        run_id, {"expected_draft_version": draft_version}
+    )
+    job_id = accepted["job"]["job_id"]
+    assert started.wait(timeout=2)
+
+    cancelled = service.cancel_job(job_id)
+    assert cancelled["job"]["state"] == "cancelled"
+    release.set()
+    assert finished.wait(timeout=2)
+
+    job = service.jobs.get(job_id)
+    run = service._run(run_id)
+    assert job.state == "cancelled"
+    assert job.result is None
+    assert run.state == "cancelled"
+    assert run.runtime_status == "cancelled"
+    assert run.pending_build_id is None
+    assert run.last_build_id is None
+    service.jobs.close()
