@@ -36,6 +36,19 @@ It does not contain the writing backend. The integration boundary is a frozen
 
 No 0.9.3 source or runtime data is modified.
 
+## Persistent runtime
+
+`data/runtime.sqlite3` is the fact source for production runs, work items, job
+attempts, and their sequenced runtime events. The schema uses tracked,
+transactional migrations. Existing `data/runs/*.json` and `data/jobs/*.json`
+files are read only as one-way migration inputs; new state is not written back
+to those files.
+
+On startup, attempts left in `queued` or `running` are marked `abandoned`.
+Retry is always explicit and creates a new attempt for the same work item.
+Cancellation is persisted before it is acknowledged, and late model or compile
+results cannot update the associated run or become the accepted job result.
+
 ## Run
 
 ```powershell
