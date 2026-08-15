@@ -20,6 +20,16 @@ from halocue_integrated.gateway import route_request
 from halocue_integrated.server import IntegratedRuntime
 
 
+def _isolate_optional_local_assets(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "HALOCUE_RESOURCE_INDEX", str(tmp_path / "missing-resource-index.json")
+    )
+    monkeypatch.setenv(
+        "HALOCUE_NAME_BASELINE", str(tmp_path / "missing-name-baseline.json")
+    )
+    monkeypatch.delenv("HALOCUE_AA_DATA", raising=False)
+
+
 def test_route_request_keeps_api_domains_separate():
     assert route_request("/api/v1/works") == ("writing", "/api/v1/works")
     assert route_request("/production/api/v1/health") == ("production", "/api/v1/health")
@@ -30,7 +40,8 @@ def test_route_request_keeps_api_domains_separate():
     )
 
 
-def test_integrated_runtime_serves_both_workbenches_and_apis(tmp_path):
+def test_integrated_runtime_serves_both_workbenches_and_apis(tmp_path, monkeypatch):
+    _isolate_optional_local_assets(monkeypatch, tmp_path)
     runtime = IntegratedRuntime(
         host="127.0.0.1",
         port=0,
@@ -80,7 +91,10 @@ def test_integrated_runtime_serves_both_workbenches_and_apis(tmp_path):
     assert 'productionNav.matches(\'.locked-nav,[aria-disabled="true"]\')' in integration_shell_js
 
 
-def test_script_release_crosses_the_real_writing_production_boundary(tmp_path):
+def test_script_release_crosses_the_real_writing_production_boundary(
+    tmp_path, monkeypatch
+):
+    _isolate_optional_local_assets(monkeypatch, tmp_path)
     runtime = IntegratedRuntime(
         host="127.0.0.1",
         port=0,

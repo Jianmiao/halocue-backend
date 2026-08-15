@@ -15,6 +15,7 @@ from halocue_production.errors import ProductionError
 from halocue_production.config import Settings
 from halocue_production.service import ProductionService
 from halocue_production.jobs import JobRecord, JobRegistry
+from halocue_production.direction_models import CancellableModelProvider
 from halocue_production.model_settings import DirectionModelSettings
 
 
@@ -1580,17 +1581,26 @@ def test_real_compile_and_install_use_isolated_workspace(settings, tmp_path):
         },
     )
     token = approved["run"]["draft_token"]
-    build_id = service.adapter.create_compile_snapshot(
-        token, approved["draft"]["draft_version"]
+    status, accepted = service.compile(
+        run_id,
+        {"expected_draft_version": approved["draft"]["draft_version"]},
     )
-    built = service.adapter.execute_compile(token, build_id)
+    assert status == 202
+    build_id = accepted["build_id"]
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        compile_job = service.jobs.get(accepted["job"]["job_id"])
+        if compile_job and compile_job.state in {"succeeded", "failed"}:
+            break
+        time.sleep(0.02)
+    assert compile_job and compile_job.state == "succeeded"
+    built = compile_job.result["bundle"]
     assert built["build_id"] == build_id
     assert built["bundle_dir"].startswith(str(settings.data_dir / "drafts"))
 
     run = service._run(run_id)
-    run.state = "compiled"
-    run.last_build_id = build_id
-    service.repository.save_run(run)
+    assert run.state == "compiled"
+    assert run.last_build_id == build_id
     options = service.install_options(run_id)
     assert options["source_project"] == "隔离构建测试"
     assert options["existing_install"] is None
@@ -2096,6 +2106,7 @@ def test_job_registry_cancels_queued_and_running_jobs(tmp_path):
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    queued_cleaned = threading.Event()
 
     def blocking_job():
         started.set()
@@ -2105,9 +2116,12 @@ def test_job_registry_cancels_queued_and_running_jobs(tmp_path):
 
     running = registry.submit("blocking", blocking_job)
     assert started.wait(timeout=2)
-    queued = registry.submit("queued", lambda: {"ok": True})
+    queued = registry.submit(
+        "queued", lambda: {"ok": True}, on_cancel=queued_cleaned.set
+    )
     assert registry.cancel(queued.job_id) is True
     assert registry.get(queued.job_id).state == "cancelled"
+    assert queued_cleaned.is_set()
     assert registry.cancel(running.job_id) is True
     assert registry.get(running.job_id).state == "cancelled"
     release.set()
@@ -2127,16 +2141,22 @@ def test_cancelled_compile_cannot_register_late_build(settings):
     release = threading.Event()
     finished = threading.Event()
     build_id = "build-000000000001"
+    draft_dir = Path(service.adapter.store.get_draft_path(created["run"]["draft_token"]))
+    late_bundle = draft_dir / "builds" / "1" / build_id
 
     service.adapter.create_compile_snapshot = lambda _token, _expected: build_id
 
     def late_compile(_token, _build_id):
         started.set()
         release.wait(timeout=3)
+        late_bundle.mkdir(parents=True)
+        (late_bundle / "bundle.complete").write_text("late", encoding="utf-8")
         finished.set()
         return {"build_id": build_id, "bundle_dir": "workspace://late-build"}
 
-    service.adapter.execute_compile = late_compile
+    service.adapter.execute_compile_cancellable = (
+        lambda token, build, *, cancellation_probe: late_compile(token, build)
+    )
     _, accepted = service.compile(
         run_id, {"expected_draft_version": draft_version}
     )
@@ -2156,4 +2176,188 @@ def test_cancelled_compile_cannot_register_late_build(settings):
     assert run.runtime_status == "cancelled"
     assert run.pending_build_id is None
     assert run.last_build_id is None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and late_bundle.exists():
+        time.sleep(0.01)
+    assert not late_bundle.exists()
     service.jobs.close()
+
+
+def test_cancellable_model_provider_stops_during_stream_activity():
+    state = {"receiving": False, "completed": False}
+
+    class StreamingProvider:
+        name = "fake"
+        model = "streaming"
+        stats = {}
+
+        def complete_json_stream(
+            self, _static, _volatile, _user, _schema, *, on_activity
+        ):
+            state["receiving"] = True
+            on_activity({"state": "receiving"})
+            state["completed"] = True
+            return {"ok": True}
+
+    provider = CancellableModelProvider(
+        StreamingProvider(), lambda: state["receiving"]
+    )
+    with pytest.raises(ProductionError) as raised:
+        provider.complete_json("system", "", "user", {"type": "object"})
+
+    assert raised.value.code == "operation_cancelled"
+    assert state["completed"] is False
+
+
+def test_cancellable_compile_terminates_worker_without_inheriting_api_keys(
+    settings, monkeypatch
+):
+    service = ProductionService(settings)
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = FakeProcess()
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        return process
+
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-compile-worker")
+    monkeypatch.setenv("PYTHONPATH", "must-not-reach-compile-worker")
+    monkeypatch.setattr(
+        "halocue_production.legacy_adapter.subprocess.Popen", fake_popen
+    )
+    discarded = []
+    service.adapter.discard_compile_output = (
+        lambda token, build_id: discarded.append((token, build_id))
+    )
+
+    with pytest.raises(ProductionError) as raised:
+        service.adapter.execute_compile_cancellable(
+            "draft-000000000001",
+            "build-000000000001",
+            cancellation_probe=lambda: True,
+        )
+
+    assert raised.value.code == "operation_cancelled"
+    assert process.terminated is True
+    assert process.killed is False
+    assert discarded == [("draft-000000000001", "build-000000000001")]
+    assert "OPENAI_API_KEY" not in captured["environment"]
+    assert "must-not-reach-compile-worker" not in captured["environment"]["PYTHONPATH"]
+    assert "must-not-reach-compile-worker" not in " ".join(captured["command"])
+    service.jobs.close()
+
+
+def test_discard_compile_output_removes_only_cancelled_build(settings):
+    service = ProductionService(settings)
+    created = service.create_run(
+        {"project": "清理取消构建", "source": {"kind": "inline", "text": "旁白: 测试\n"}}
+    )
+    token = created["run"]["draft_token"]
+    draft_dir = Path(service.adapter.store.get_draft_path(token))
+    build_id = "build-000000000001"
+    retained_id = "build-000000000002"
+    cancelled_tmp = draft_dir / "builds" / ".tmp" / build_id
+    cancelled_final = draft_dir / "builds" / "1" / build_id
+    retained = draft_dir / "builds" / "1" / retained_id
+    for directory in (cancelled_tmp, cancelled_final, retained):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "marker.txt").write_text("test", encoding="utf-8")
+    session_path = draft_dir / "session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["last_compiled_build_id"] = build_id
+    session["last_compiled_content_revision"] = 1
+    session_path.write_text(json.dumps(session, ensure_ascii=False), encoding="utf-8")
+
+    service.adapter.discard_compile_output(token, build_id)
+
+    restored = json.loads(session_path.read_text(encoding="utf-8"))
+    assert not cancelled_tmp.exists()
+    assert not cancelled_final.exists()
+    assert retained.is_dir()
+    assert "last_compiled_build_id" not in restored
+    assert "last_compiled_content_revision" not in restored
+    with pytest.raises(ProductionError) as raised:
+        service.adapter.discard_compile_output(token, "../build-000000000001")
+    assert raised.value.code == "compile_cleanup_path_invalid"
+    service.jobs.close()
+
+
+def test_discard_compile_output_rejects_symlink_escape(settings, tmp_path):
+    service = ProductionService(settings)
+    created = service.create_run(
+        {"project": "清理路径防护", "source": {"kind": "inline", "text": "旁白: 测试\n"}}
+    )
+    token = created["run"]["draft_token"]
+    draft_dir = Path(service.adapter.store.get_draft_path(token))
+    builds_dir = draft_dir / "builds"
+    outside = tmp_path / "outside-builds"
+    protected = outside / "1" / "build-000000000001"
+    protected.mkdir(parents=True)
+    marker = protected / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+    try:
+        builds_dir.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        service.jobs.close()
+        pytest.skip("当前 Windows 账户不允许创建测试用符号链接")
+
+    with pytest.raises(ProductionError) as raised:
+        service.adapter.discard_compile_output(token, "build-000000000001")
+
+    assert raised.value.code == "compile_cleanup_path_invalid"
+    assert marker.read_text(encoding="utf-8") == "keep"
+    service.jobs.close()
+
+
+def test_restart_cleans_abandoned_compile_output(settings):
+    first = ProductionService(settings)
+    created = first.create_run(
+        {"project": "重启清理构建", "source": {"kind": "inline", "text": "旁白: 测试\n"}}
+    )
+    run_id = created["run"]["run_id"]
+    token = created["run"]["draft_token"]
+    build_id = "build-000000000001"
+    attempt = first.repository.runtime.create_attempt(
+        job_id="job-000000000001",
+        kind="compile",
+        legacy_run_id=run_id,
+        retry_context={"expected_draft_version": 1, "build_id": build_id},
+    )
+    assert first.repository.runtime.start_attempt(attempt["attempt_id"]) is True
+    abandoned_output = (
+        Path(first.adapter.store.get_draft_path(token))
+        / "builds"
+        / "1"
+        / build_id
+    )
+    abandoned_output.mkdir(parents=True)
+    (abandoned_output / "bundle.complete").write_text("late", encoding="utf-8")
+    first.jobs.close()
+
+    restored = ProductionService(settings)
+
+    assert restored.jobs.get("job-000000000001").state == "abandoned"
+    assert not abandoned_output.exists()
+    restored.jobs.close()
