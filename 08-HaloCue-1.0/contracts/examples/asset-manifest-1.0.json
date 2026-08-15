@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "id": "77777777-7777-4777-8777-777777777777",
+  "content_hash": "sha256:05d1d45fc18a98940e946beda747510790134d8a3e1b60e5bbaa83536fcde8d5",
+  "created_at": "2026-08-15T04:05:00Z",
+  "assets": [
+    {
+      "asset_id": "abababab-abab-4bab-8bab-abababababab",
+      "kind": "character",
+      "uri": "workspace://assets/characters/alice-school.bundle",
+      "content_hash": "sha256:abababababababababababababababababababababababababababababababab",
+      "display_name": "爱丽丝·校服",
+      "media_type": "application/x-halocue-character",
+      "metadata": {"faces": ["default", "smile"], "form": "school"}
+    },
+    {
+      "asset_id": "14141414-1414-4414-8414-141414141414",
+      "kind": "background",
+      "uri": "workspace://assets/backgrounds/classroom.png",
+      "content_hash": "sha256:1414141414141414141414141414141414141414141414141414141414141414",
+      "display_name": "游戏开发部活动室",
+      "media_type": "image/png",
+      "metadata": {"width": 1920, "height": 1080}
+    }
+  ]
+}

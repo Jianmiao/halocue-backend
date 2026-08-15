@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "request_id": "66666666-6666-4666-8666-666666666666",
+  "script_release": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "display_version": "v4",
+    "content_hash": "sha256:f63e8648ba826028afa364f9172f1559c8fdddbe87f6ef7badf79f43b0aca2c7",
+    "manifest_uri": "workspace://releases/11111111-1111-4111-8111-111111111111/manifest.json"
+  },
+  "script_manifest_version": "1.0",
+  "asset_manifest": {
+    "id": "77777777-7777-4777-8777-777777777777",
+    "version": "1.0",
+    "content_hash": "sha256:05d1d45fc18a98940e946beda747510790134d8a3e1b60e5bbaa83536fcde8d5",
+    "uri": "workspace://assets/77777777-7777-4777-8777-777777777777/manifest.json"
+  },
+  "production_policy": {
+    "asset_reference_mode": "whitelist_only",
+    "allow_placeholders": false,
+    "target": "pc_aap"
+  },
+  "idempotency_key": "sha256:c0f34913d4619a0b77713cbe8bb52a07c0adbb5096bdd0210bd17b57b75fca88"
+}

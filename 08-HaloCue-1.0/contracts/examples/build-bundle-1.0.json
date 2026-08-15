@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "id": "15151515-1515-4515-8515-151515151515",
+  "request_id": "66666666-6666-4666-8666-666666666666",
+  "performance_draft_id": "88888888-8888-4888-8888-888888888888",
+  "build_bundle_ref": "artifact://builds/15151515-1515-4515-8515-151515151515",
+  "input_hashes": {
+    "script_release": "sha256:f63e8648ba826028afa364f9172f1559c8fdddbe87f6ef7badf79f43b0aca2c7",
+    "performance_draft": "sha256:a215b2ca4fd291ff521989ac5a9f25033c14eac5e0d8ab9a912d61d5fd16b4bb",
+    "asset_manifest": "sha256:05d1d45fc18a98940e946beda747510790134d8a3e1b60e5bbaa83536fcde8d5"
+  },
+  "producer": {
+    "adapter_id": "aa-compat",
+    "engine_id": "azurearchive",
+    "engine_version": "0.9.3"
+  },
+  "target": "pc_aap",
+  "deliverables": [
+    {
+      "artifact_id": "16161616-1616-4616-8616-161616161616",
+      "kind": "aap",
+      "uri": "workspace://builds/15151515-1515-4515-8515-151515151515/output.aap",
+      "content_hash": "sha256:1616161616161616161616161616161616161616161616161616161616161616",
+      "media_type": "application/x-azurearchive-project",
+      "size_bytes": 4096
+    }
+  ],
+  "warnings": [],
+  "created_at": "2026-08-15T04:20:00Z"
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "event_id": "17171717-1717-4717-8717-171717171717",
+  "kind": "artifact_created",
+  "run_id": "18181818-1818-4818-8818-181818181818",
+  "work_item_id": "19191919-1919-4919-8919-191919191919",
+  "attempt_id": "20202020-2020-4020-8020-202020202020",
+  "request_id": "66666666-6666-4666-8666-666666666666",
+  "sequence": 4,
+  "timestamp": "2026-08-15T04:20:00Z",
+  "progress": {"percent": 100, "stage": "compile"},
+  "artifact_refs": [
+    "artifact://builds/15151515-1515-4515-8515-151515151515"
+  ],
+  "message": "BuildBundle 已校验并登记。"
+}

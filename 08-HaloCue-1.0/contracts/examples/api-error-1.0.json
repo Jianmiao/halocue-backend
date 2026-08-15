@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "code": "ASSET_REFERENCE_NOT_ALLOWED",
+  "category": "validation",
+  "message": "素材引用不在当前任务的冻结白名单中。",
+  "detail_ref": "artifact://errors/21212121-2121-4121-8121-212121212121",
+  "retryability": "after_user_action",
+  "scope_refs": [
+    "scene:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  ],
+  "caused_by_attempt": "20202020-2020-4020-8020-202020202020"
+}

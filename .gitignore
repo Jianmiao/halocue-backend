@@ -1,0 +1,30 @@
+# External compatibility inputs and read-only evidence.
+/01-完整程序/
+/references/
+/MANIFEST-SHA256.txt
+
+# Python caches and local environments.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/.venv/
+**/venv/
+
+# Local application state and generated outputs.
+**/data/
+**/artifacts/
+**/workspace/
+**/dist/
+**/build/
+*.log
+
+# Local credentials and overrides.
+.env
+.env.*
+!.env.example
+*.key
+*.pem

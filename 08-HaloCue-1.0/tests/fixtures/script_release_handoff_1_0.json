@@ -1,0 +1,16 @@
+{
+  "project": "Contract fixture v1",
+  "generation_mode": "format_only",
+  "source": {
+    "kind": "inline",
+    "text": "## Scene 01\nNarrator: Ready.\n"
+  },
+  "script_release": {
+    "schema_version": "1.0",
+    "id": "release-000000000001",
+    "work_id": "work-000000000001",
+    "display_version": "v1",
+    "content_hash": "f63e8648ba826028afa364f9172f1559c8fdddbe87f6ef7badf79f43b0aca2c7",
+    "writing_pack_version": "ba-writing.productized/1.0.0"
+  }
+}
