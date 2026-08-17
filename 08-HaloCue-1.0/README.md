@@ -39,10 +39,16 @@ No 0.9.3 source or runtime data is modified.
 ## Persistent runtime
 
 `data/runtime.sqlite3` is the fact source for production runs, work items, job
-attempts, and their sequenced runtime events. The schema uses tracked,
-transactional migrations. Existing `data/runs/*.json` and `data/jobs/*.json`
-files are read only as one-way migration inputs; new state is not written back
-to those files.
+attempts, sequenced runtime events, and registered workspace files. The schema
+uses tracked, transactional migrations. Existing `data/runs/*.json` and
+`data/jobs/*.json` files are read only as one-way migration inputs; new state is
+not written back to those files.
+
+`data/workspace` is owned by the ArtifactStore. Domain payloads reference files
+with `workspace://` URIs and `sha256:` hashes, never physical paths. A commit is
+written and flushed to a same-directory temporary file, verified, atomically
+replaced, and then registered in SQLite. Reusing a URI with different bytes is
+rejected instead of silently overwriting the prior file.
 
 On startup, attempts left in `queued` or `running` are marked `abandoned`.
 Retry is always explicit and creates a new attempt for the same work item.

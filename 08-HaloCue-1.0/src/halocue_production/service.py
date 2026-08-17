@@ -5,9 +5,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .artifacts import ArtifactStore
 from .config import Settings
-from .errors import ProductionError
 from .direction_models import CancellableModelProvider, DirectionModelGateway
+from .errors import ProductionError
 from .jobs import CancellationToken, JobOutcome, JobRegistry
 from .legacy_adapter import Legacy093Adapter
 from .models import ProductionRun, ScriptRelease, WorkItem, content_sha256, new_id, utc_now
@@ -40,6 +41,9 @@ class ProductionService:
         settings.prepare()
         self.settings = settings
         self.repository = ProductionRepository(settings.data_dir)
+        self.artifacts = ArtifactStore(
+            settings.data_dir / "workspace", self.repository.runtime
+        )
         self.settings_store = SettingsStore(settings.data_dir)
         persisted = self.settings_store.load()
         if settings.aa_data is None and persisted.get("aa_data"):

@@ -64,21 +64,26 @@ def test_runtime_store_creates_current_schema(tmp_path):
         "work_items",
         "job_attempts",
         "production_events",
+        "workspace_files",
     } <= tables
 
 
-def test_runtime_store_upgrades_v1_to_v2(tmp_path):
+def test_runtime_store_upgrades_v1_to_current(tmp_path):
     path = tmp_path / "runtime.sqlite3"
     RuntimeStore(path, target_version=1)
 
     upgraded = RuntimeStore(path)
 
-    assert upgraded.schema_version() == 2
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
     with sqlite3.connect(path) as connection:
         attempt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(job_attempts)")
         }
+        workspace_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workspace_files)")
+        }
     assert "cancellation_requested" in attempt_columns
+    assert {"uri", "relative_path", "content_hash", "size_bytes"} <= workspace_columns
 
 
 def test_runtime_store_rejects_newer_schema_version(tmp_path):

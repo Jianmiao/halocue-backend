@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 2
+RUNTIME_SCHEMA_VERSION = 3
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -124,6 +124,22 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
         "CREATE INDEX idx_production_events_run_sequence ON production_events(run_id, timestamp, sequence)",
+    ),
+    3: (
+        """
+        CREATE TABLE workspace_files (
+          uri TEXT PRIMARY KEY,
+          relative_path TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          media_type TEXT NOT NULL,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX idx_workspace_files_hash ON workspace_files(content_hash)",
     ),
 }
 
@@ -278,6 +294,153 @@ class RuntimeStore:
             return int(connection.execute("PRAGMA user_version").fetchone()[0])
         finally:
             connection.close()
+
+    @staticmethod
+    def _workspace_file_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "uri": str(row["uri"]),
+            "relative_path": str(row["relative_path"]),
+            "kind": str(row["kind"]),
+            "content_hash": str(row["content_hash"]),
+            "size_bytes": int(row["size_bytes"]),
+            "media_type": str(row["media_type"]),
+            "metadata": _json_value(row["metadata_json"], {}),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_workspace_file(self, uri: str) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM workspace_files WHERE uri=?", (uri,)
+            ).fetchone()
+            return self._workspace_file_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def find_workspace_file_by_hash(
+        self, content_hash: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM workspace_files WHERE content_hash=?", (content_hash,)
+            ).fetchone()
+            return self._workspace_file_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def register_workspace_file(
+        self,
+        *,
+        uri: str,
+        relative_path: str,
+        kind: str,
+        content_hash: str,
+        size_bytes: int,
+        media_type: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM workspace_files WHERE uri=?", (uri,)
+            ).fetchone()
+            if existing:
+                immutable_fields = {
+                    "relative_path": relative_path,
+                    "kind": kind,
+                    "content_hash": content_hash,
+                    "size_bytes": int(size_bytes),
+                    "media_type": media_type,
+                }
+                if any(
+                    str(existing[field]) != str(value)
+                    for field, value in immutable_fields.items()
+                ):
+                    raise ProductionError(
+                        "workspace_file_conflict",
+                        "同一工作区 URI 已登记不同内容",
+                        status=409,
+                        details={"uri": uri, "existing_hash": str(existing["content_hash"])},
+                    )
+                connection.execute(
+                    "UPDATE workspace_files SET metadata_json=?, updated_at=? WHERE uri=?",
+                    (_json(metadata), now, uri),
+                )
+            else:
+                duplicate = connection.execute(
+                    "SELECT uri FROM workspace_files WHERE content_hash=?",
+                    (content_hash,),
+                ).fetchone()
+                if duplicate:
+                    raise ProductionError(
+                        "workspace_file_duplicate",
+                        "相同内容已在工作区登记",
+                        status=409,
+                        details={
+                            "uri": uri,
+                            "existing_uri": str(duplicate["uri"]),
+                            "content_hash": content_hash,
+                        },
+                    )
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO workspace_files(
+                          uri, relative_path, kind, content_hash, size_bytes,
+                          media_type, metadata_json, created_at, updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            uri,
+                            relative_path,
+                            kind,
+                            content_hash,
+                            int(size_bytes),
+                            media_type,
+                            _json(metadata),
+                            now,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    duplicate = connection.execute(
+                        "SELECT uri FROM workspace_files WHERE content_hash=?",
+                        (content_hash,),
+                    ).fetchone()
+                    if duplicate:
+                        raise ProductionError(
+                            "workspace_file_duplicate",
+                            "相同内容已在工作区登记",
+                            status=409,
+                            details={
+                                "uri": uri,
+                                "existing_uri": str(duplicate["uri"]),
+                                "content_hash": content_hash,
+                            },
+                        ) from exc
+                    raise ProductionError(
+                        "workspace_file_conflict",
+                        "工作区文件路径已登记到其他 URI",
+                        status=409,
+                        details={"uri": uri},
+                    ) from exc
+            row = connection.execute(
+                "SELECT * FROM workspace_files WHERE uri=?", (uri,)
+            ).fetchone()
+            if row is None:
+                raise ProductionError(
+                    "workspace_file_registration_failed",
+                    "工作区文件登记失败",
+                    status=500,
+                )
+            return self._workspace_file_payload(row)
 
     def save_production_run(
         self, payload: dict[str, Any]
