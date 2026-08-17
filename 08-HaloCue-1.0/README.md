@@ -36,6 +36,24 @@ It does not contain the writing backend. The integration boundary is a frozen
 
 No 0.9.3 source or runtime data is modified.
 
+## Persistent runtime
+
+`data/runtime.sqlite3` is the fact source for production runs, work items, job
+attempts, and their sequenced runtime events. The schema uses tracked,
+transactional migrations. Existing `data/runs/*.json` and `data/jobs/*.json`
+files are read only as one-way migration inputs; new state is not written back
+to those files.
+
+On startup, attempts left in `queued` or `running` are marked `abandoned`.
+Retry is always explicit and creates a new attempt for the same work item.
+Cancellation is persisted before it is acknowledged, and late model or compile
+results cannot update the associated run or become the accepted job result.
+Model providers with streaming support check cancellation while receiving
+chunks. AA compilation runs in a HaloCue-owned child process with a minimal
+environment; cancellation terminates that process and removes the cancelled
+Build ID's temporary and completed bundle directories. Abandoned compile
+outputs are cleaned again on the next startup.
+
 ## Run
 
 ```powershell

@@ -4,10 +4,83 @@ import importlib
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .errors import ProductionError
 from .model_settings import DirectionModelSettings
+
+
+CancellationProbe = Callable[[], bool]
+
+
+class CancellableModelProvider:
+    """Add persisted cancellation checks without changing the AA provider."""
+
+    def __init__(self, provider: Any, cancellation_probe: CancellationProbe) -> None:
+        self._provider = provider
+        self._cancellation_probe = cancellation_probe
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
+
+    def _check(self) -> None:
+        if self._cancellation_probe():
+            raise ProductionError(
+                "operation_cancelled", "模型调用已取消", status=409
+            )
+
+    def _activity(self, downstream=None):
+        def callback(event: dict[str, Any]) -> None:
+            self._check()
+            if downstream is not None:
+                downstream(event)
+            self._check()
+
+        return callback
+
+    def complete_json(self, static_system, volatile_system, user, schema):
+        self._check()
+        stream = getattr(self._provider, "complete_json_stream", None)
+        if callable(stream):
+            result = stream(
+                static_system,
+                volatile_system,
+                user,
+                schema,
+                on_activity=self._activity(),
+            )
+        else:
+            result = self._provider.complete_json(
+                static_system, volatile_system, user, schema
+            )
+        self._check()
+        return result
+
+    def complete_json_stream(
+        self,
+        static_system,
+        volatile_system,
+        user,
+        schema,
+        *,
+        on_activity=None,
+    ):
+        self._check()
+        stream = getattr(self._provider, "complete_json_stream", None)
+        if callable(stream):
+            result = stream(
+                static_system,
+                volatile_system,
+                user,
+                schema,
+                on_activity=self._activity(on_activity),
+            )
+        else:
+            result = self._provider.complete_json(
+                static_system, volatile_system, user, schema
+            )
+        self._check()
+        return result
 
 
 class DirectionModelGateway:
@@ -35,8 +108,15 @@ class DirectionModelGateway:
                 details={"type": type(exc).__name__},
             ) from exc
 
-    def test_connection(self) -> dict[str, Any]:
+    def test_connection(
+        self, cancellation_probe: CancellationProbe | None = None
+    ) -> dict[str, Any]:
         provider = self.provider()
+        active_provider = (
+            CancellableModelProvider(provider, cancellation_probe)
+            if cancellation_probe is not None
+            else provider
+        )
         schema = {
             "type": "object",
             "properties": {"ok": {"type": "boolean"}},
@@ -45,7 +125,7 @@ class DirectionModelGateway:
         }
         started = time.monotonic()
         try:
-            result = provider.complete_json(
+            result = active_provider.complete_json(
                 "You are a connection test. Return JSON only.",
                 "",
                 'Return exactly {"ok":true}.',

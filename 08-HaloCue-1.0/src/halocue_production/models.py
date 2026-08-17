@@ -50,6 +50,7 @@ class WorkItem:
     state: str
     progress: float
     detail: str
+    work_item_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -70,6 +71,8 @@ class ProductionRun:
     pending_build_id: str | None = None
     last_build_id: str | None = None
     last_installed_project: str | None = None
+    production_run_id: str | None = None
+    runtime_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = self.__dict__.copy()
@@ -80,5 +83,7 @@ class ProductionRun:
     def from_dict(cls, value: dict[str, Any]) -> "ProductionRun":
         data = dict(value)
         data.setdefault("pending_build_id", None)
+        data.setdefault("production_run_id", None)
+        data.setdefault("runtime_status", None)
         data["work_items"] = [WorkItem(**item) for item in data.get("work_items", [])]
         return cls(**data)

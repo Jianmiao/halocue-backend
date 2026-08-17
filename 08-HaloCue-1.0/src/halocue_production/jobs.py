@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import datetime as dt
+import inspect
 import json
-import os
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -10,7 +9,40 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .errors import ProductionError
 from .models import new_id
+from .runtime import RuntimeStore
+
+
+class JobCancelled(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class JobOutcome:
+    result: dict[str, Any]
+    commit: Callable[[], None] | None = None
+
+
+class CancellationToken:
+    def __init__(
+        self, runtime: RuntimeStore, attempt_id: str, event: threading.Event
+    ) -> None:
+        self._runtime = runtime
+        self.attempt_id = attempt_id
+        self._event = event
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set() or not self._runtime.attempt_accepts_result(
+            self.attempt_id
+        )
+
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancelled():
+            raise JobCancelled("job attempt was cancelled")
 
 
 @dataclass
@@ -25,6 +57,14 @@ class JobRecord:
     run_id: str | None = None
     # Only non-sensitive inputs needed to submit the same stage again.
     retry_context: dict[str, Any] = field(default_factory=dict)
+    attempt_id: str | None = None
+    work_item_id: str | None = None
+    production_run_id: str | None = None
+    ordinal: int = 1
+    provider: str | None = None
+    model_or_engine: str | None = None
+    request_digest: str | None = None
+    cancellation_requested: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -40,127 +80,307 @@ class JobRecord:
             result=value.get("result") if isinstance(value.get("result"), dict) else None,
             error=value.get("error") if isinstance(value.get("error"), dict) else None,
             run_id=str(value.get("run_id") or "").strip() or None,
-            retry_context=(value.get("retry_context") if isinstance(value.get("retry_context"), dict) else {}),
+            retry_context=(
+                value.get("retry_context")
+                if isinstance(value.get("retry_context"), dict)
+                else {}
+            ),
+            attempt_id=str(value.get("attempt_id") or "").strip() or None,
+            work_item_id=str(value.get("work_item_id") or "").strip() or None,
+            production_run_id=(
+                str(value.get("production_run_id") or "").strip() or None
+            ),
+            ordinal=int(value.get("ordinal") or 1),
+            provider=str(value.get("provider") or "").strip() or None,
+            model_or_engine=(
+                str(value.get("model_or_engine") or "").strip() or None
+            ),
+            request_digest=str(value.get("request_digest") or "").strip() or None,
+            cancellation_requested=bool(value.get("cancellation_requested", False)),
         )
+
+
+Task = Callable[..., dict[str, Any] | JobOutcome]
+FailureHandler = Callable[[Exception], None]
+CancelHandler = Callable[[], None]
 
 
 class JobRegistry:
     _JOB_ID = re.compile(r"job-[0-9a-f]{12}")
 
-    def __init__(self, base_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: Path | RuntimeStore,
+        *,
+        runtime: RuntimeStore | None = None,
+    ) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="halocue")
-        self._jobs: dict[str, JobRecord] = {}
         self._futures: dict[str, Future] = {}
+        self._tokens: dict[str, CancellationToken] = {}
+        self._cancel_handlers: dict[str, CancelHandler] = {}
         self._lock = threading.RLock()
-        self._base_dir = base_dir
-        if self._base_dir:
+        self._commit_lock = threading.RLock()
+        if isinstance(base_dir, RuntimeStore):
+            if runtime is not None and runtime is not base_dir:
+                raise ValueError("conflicting runtime stores")
+            self._base_dir: Path | None = None
+            self._runtime = base_dir
+        else:
+            self._base_dir = Path(base_dir)
             self._base_dir.mkdir(parents=True, exist_ok=True)
-            self._restore()
+            self._runtime = runtime or RuntimeStore(
+                self._base_dir.parent / "runtime.sqlite3"
+            )
+            self._import_legacy_jobs()
+        self._runtime.abandon_active_attempts()
 
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()
-
-    def _path(self, job_id: str) -> Path | None:
-        return self._base_dir / f"{job_id}.json" if self._base_dir else None
-
-    def _persist(self, record: JobRecord) -> None:
-        path = self._path(record.job_id)
-        if path is None:
+    def _import_legacy_jobs(self) -> None:
+        if self._base_dir is None:
             return
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(record.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.replace(temporary, path)
-
-    def _restore(self) -> None:
-        for path in self._base_dir.glob("job-*.json") if self._base_dir else []:
+        for path in self._base_dir.glob("job-*.json"):
             try:
-                record = JobRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                value = json.loads(path.read_text(encoding="utf-8"))
+                record = JobRecord.from_dict(value)
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if not self._JOB_ID.fullmatch(record.job_id):
-                continue
-            if record.state in {"queued", "running"}:
-                record.state = "interrupted"
-                record.error = {
-                    "code": "job_interrupted",
-                    "message": "服务重启时任务仍在执行，需要重新提交",
-                }
-                record.updated_at = self._now()
-                self._persist(record)
-            self._jobs[record.job_id] = record
+            if self._JOB_ID.fullmatch(record.job_id):
+                self._runtime.import_legacy_attempt(record.to_dict())
+
+    @staticmethod
+    def _invoke(task: Task, token: CancellationToken) -> dict[str, Any] | JobOutcome:
+        try:
+            inspect.signature(task).bind(token)
+        except (TypeError, ValueError):
+            return task()
+        return task(token)
+
+    def _create_record(
+        self,
+        kind: str,
+        *,
+        run_id: str | None,
+        retry_context: dict[str, Any] | None,
+        work_item_id: str | None,
+        provider: str | None,
+        model_or_engine: str | None,
+    ) -> JobRecord:
+        value = self._runtime.create_attempt(
+            job_id=new_id("job"),
+            kind=kind,
+            legacy_run_id=run_id,
+            retry_context=dict(retry_context or {}),
+            work_item_id=work_item_id,
+            provider=provider,
+            model_or_engine=model_or_engine,
+        )
+        return JobRecord.from_dict(value)
+
+    def _fail_attempt(
+        self,
+        attempt_id: str,
+        token: CancellationToken,
+        exc: Exception,
+        on_failure: FailureHandler | None,
+    ) -> None:
+        with self._commit_lock:
+            if token.is_cancelled():
+                return
+            if on_failure is not None:
+                on_failure(exc)
+            self._runtime.fail_attempt(
+                attempt_id,
+                {
+                    "code": str(getattr(exc, "code", "job_failed")),
+                    "message": str(exc),
+                    "status": int(getattr(exc, "status", 500)),
+                    "details": getattr(exc, "details", {}) or {},
+                },
+            )
+
+    def _execute(
+        self,
+        record: JobRecord,
+        task: Task,
+        token: CancellationToken,
+        on_failure: FailureHandler | None,
+        on_cancel: CancelHandler | None,
+    ) -> dict[str, Any] | None:
+        attempt_id = str(record.attempt_id)
+        if not self._runtime.start_attempt(attempt_id):
+            if token.is_cancelled():
+                self._run_cancel_handler(on_cancel)
+            return None
+        try:
+            token.raise_if_cancelled()
+            result = self._invoke(task, token)
+            token.raise_if_cancelled()
+        except JobCancelled:
+            self._runtime.cancel_attempt(attempt_id)
+            self._run_cancel_handler(on_cancel)
+            return None
+        except Exception as exc:
+            if token.is_cancelled():
+                self._run_cancel_handler(on_cancel)
+                return None
+            self._fail_attempt(attempt_id, token, exc, on_failure)
+            return None
+        outcome = result if isinstance(result, JobOutcome) else JobOutcome(result)
+        if not isinstance(outcome.result, dict):
+            error = TypeError("job result must be an object")
+            self._fail_attempt(attempt_id, token, error, on_failure)
+            return None
+        with self._commit_lock:
+            if token.is_cancelled():
+                self._run_cancel_handler(on_cancel)
+                return None
+            try:
+                if outcome.commit is not None:
+                    outcome.commit()
+            except Exception as exc:
+                self._fail_attempt(attempt_id, token, exc, on_failure)
+                return None
+            if not self._runtime.succeed_attempt(attempt_id, outcome.result):
+                return None
+        return outcome.result
+
+    @staticmethod
+    def _run_cancel_handler(handler: CancelHandler | None) -> None:
+        if handler is None:
+            return
+        try:
+            handler()
+        except (OSError, ProductionError):
+            return
 
     def submit(
         self,
         kind: str,
-        task: Callable[[], dict[str, Any]],
+        task: Task,
         *,
         run_id: str | None = None,
         retry_context: dict[str, Any] | None = None,
+        work_item_id: str | None = None,
+        provider: str | None = None,
+        model_or_engine: str | None = None,
+        on_failure: FailureHandler | None = None,
+        on_cancel: CancelHandler | None = None,
     ) -> JobRecord:
-        now = self._now()
-        record = JobRecord(
-            new_id("job"), kind, "queued", now, now,
+        record = self._create_record(
+            kind,
             run_id=run_id,
-            retry_context=dict(retry_context or {}),
+            retry_context=retry_context,
+            work_item_id=work_item_id,
+            provider=provider,
+            model_or_engine=model_or_engine,
         )
+        event = threading.Event()
+        token = CancellationToken(self._runtime, str(record.attempt_id), event)
         with self._lock:
-            self._jobs[record.job_id] = record
-            self._persist(record)
-
-        def execute() -> None:
-            with self._lock:
-                record.state = "running"
-                record.updated_at = self._now()
-                self._persist(record)
-            try:
-                result = task()
-            except Exception as exc:
-                with self._lock:
-                    record.state = "failed"
-                    record.error = {
-                        "code": str(getattr(exc, "code", "job_failed")),
-                        "message": str(exc),
-                    }
-                    record.updated_at = self._now()
-                    self._persist(record)
-            else:
-                with self._lock:
-                    record.state = "succeeded"
-                    record.result = result
-                    record.updated_at = self._now()
-                    self._persist(record)
-
-        future = self._executor.submit(execute)
-        with self._lock:
+            self._tokens[record.job_id] = token
+            if on_cancel is not None:
+                self._cancel_handlers[record.job_id] = on_cancel
+            future = self._executor.submit(
+                self._execute, record, task, token, on_failure, on_cancel
+            )
             self._futures[record.job_id] = future
+            future.add_done_callback(
+                lambda completed, job_id=record.job_id: self._forget_control(
+                    job_id, completed
+                )
+            )
         return record
+
+    def _forget_control(self, job_id: str, future: Future) -> None:
+        with self._lock:
+            if self._futures.get(job_id) is not future:
+                return
+            self._futures.pop(job_id, None)
+            self._tokens.pop(job_id, None)
+            self._cancel_handlers.pop(job_id, None)
+
+    def run_sync(
+        self,
+        kind: str,
+        task: Task,
+        *,
+        run_id: str | None = None,
+        retry_context: dict[str, Any] | None = None,
+        work_item_id: str | None = None,
+        provider: str | None = None,
+        model_or_engine: str | None = None,
+        on_failure: FailureHandler | None = None,
+        on_cancel: CancelHandler | None = None,
+    ) -> tuple[JobRecord, dict[str, Any]]:
+        record = self._create_record(
+            kind,
+            run_id=run_id,
+            retry_context=retry_context,
+            work_item_id=work_item_id,
+            provider=provider,
+            model_or_engine=model_or_engine,
+        )
+        event = threading.Event()
+        token = CancellationToken(self._runtime, str(record.attempt_id), event)
+        with self._lock:
+            self._tokens[record.job_id] = token
+            if on_cancel is not None:
+                self._cancel_handlers[record.job_id] = on_cancel
+        try:
+            result = self._execute(record, task, token, on_failure, on_cancel)
+        finally:
+            with self._lock:
+                self._tokens.pop(record.job_id, None)
+                self._cancel_handlers.pop(record.job_id, None)
+        if result is None:
+            completed = self.get(record.job_id)
+            if completed and completed.state == "failed" and completed.error:
+                error = completed.error
+                raise ProductionError(
+                    str(error.get("code") or "job_failed"),
+                    str(error.get("message") or "后台任务失败"),
+                    status=int(error.get("status") or 500),
+                    details=(error.get("details") if isinstance(error.get("details"), dict) else {}),
+                )
+            raise JobCancelled("job attempt was cancelled")
+        completed = self.get(record.job_id)
+        return completed or record, result
 
     def cancel(self, job_id: str) -> bool:
         with self._lock:
-            record = self._jobs.get(job_id)
-            future = self._futures.get(job_id)
-            if record is None or record.state != "queued" or future is None:
-                return False
-            if not future.cancel():
-                return False
-            record.state = "cancelled"
-            record.updated_at = self._now()
-            record.error = None
-            self._persist(record)
-            return True
+            with self._commit_lock:
+                record = self.get(job_id)
+                if record is None or record.state not in {"queued", "running", "started"}:
+                    return False
+                token = self._tokens.get(job_id)
+                future = self._futures.get(job_id)
+                cancel_handler = self._cancel_handlers.get(job_id)
+                if token is not None:
+                    token.cancel()
+                cancelled = self._runtime.cancel_attempt(str(record.attempt_id))
+                if cancelled and future is not None and future.cancel():
+                    self._run_cancel_handler(cancel_handler)
+                return cancelled
 
     def get(self, job_id: str) -> JobRecord | None:
-        with self._lock:
-            return self._jobs.get(job_id)
+        if not self._JOB_ID.fullmatch(str(job_id)):
+            return None
+        value = self._runtime.get_attempt(job_id)
+        return JobRecord.from_dict(value) if value else None
 
     def list(self) -> list[JobRecord]:
-        with self._lock:
-            return sorted(
-                self._jobs.values(), key=lambda item: item.updated_at, reverse=True
-            )
+        return [JobRecord.from_dict(value) for value in self._runtime.list_attempts()]
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            with self._commit_lock:
+                for token in self._tokens.values():
+                    token.cancel()
+                active = [
+                    (job_id, future, self._cancel_handlers.get(job_id))
+                    for job_id, future in self._futures.items()
+                ]
+                for job_id, future, cancel_handler in active:
+                    if future.cancel():
+                        self._run_cancel_handler(cancel_handler)
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._runtime.abandon_active_attempts()

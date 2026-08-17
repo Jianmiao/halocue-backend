@@ -18,6 +18,9 @@ from .repository import Repository, canonical_json, new_id, now, sha256_text
 from .workflow_pack import COMMON_RULES, MODE_SOURCES, PACK_VERSION, describe_pack, template_contract
 
 
+PRODUCTION_HANDOFF_TIMEOUT_SECONDS = 30
+
+
 class WritingService:
     def __init__(self, data_dir: Path, production_url: str = "http://127.0.0.1:8892", official_corpus_dir: Path | None = None):
         self.repo = Repository(data_dir)
@@ -2973,7 +2976,9 @@ class WritingService:
         }).encode("utf-8")
         request = urllib.request.Request(self.production_url + "/api/v1/production-runs", data=body, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(
+                request, timeout=PRODUCTION_HANDOFF_TIMEOUT_SECONDS
+            ) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             try:

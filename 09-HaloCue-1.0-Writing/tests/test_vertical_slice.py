@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -292,7 +293,7 @@ def test_workflow_pack_has_versioned_structured_steps(tmp_path):
     assert pack["runtime_contract"]["agent_writes_through_proposal_only"] is True
 
 
-def test_handoff_accepts_nested_run_response_and_is_idempotent(tmp_path):
+def test_handoff_accepts_nested_run_response_and_is_idempotent(tmp_path, monkeypatch):
     service = WritingService(tmp_path)
     work_id, _, proposal_id, work = build_to_proposal(service)
     accepted = service.accept_proposal(work_id, proposal_id, {"expected_version": work["version"]})
@@ -321,6 +322,14 @@ def test_handoff_accepts_nested_run_response_and_is_idempotent(tmp_path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), ProductionHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     service.production_url = f"http://127.0.0.1:{server.server_port}"
+    observed_timeouts = []
+    real_urlopen = urllib.request.urlopen
+
+    def recording_urlopen(request, *args, **kwargs):
+        observed_timeouts.append(kwargs.get("timeout"))
+        return real_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", recording_urlopen)
     try:
         first = service.handoff_release(release["release_id"])
         second = service.handoff_release(release["release_id"])
@@ -329,6 +338,7 @@ def test_handoff_accepts_nested_run_response_and_is_idempotent(tmp_path):
     assert first["production_run_id"] == "run-nested"
     assert second["idempotent"] is True
     assert ProductionHandler.posts == 1
+    assert observed_timeouts[-1] == 30
     submitted = ProductionHandler.posted_payloads[0]
     assert submitted["generation_mode"] == "format_only"
     assert submitted["script_release"] == {
