@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 5
+RUNTIME_SCHEMA_VERSION = 6
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -218,6 +218,49 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX idx_asset_manifest_history_manifest ON production_run_asset_manifest_history(manifest_id)",
         "DROP TABLE asset_manifests_v4",
+    ),
+    6: (
+        """
+        CREATE TABLE frozen_script_releases (
+          id TEXT PRIMARY KEY,
+          schema_version TEXT NOT NULL,
+          work_id TEXT NOT NULL,
+          display_version TEXT NOT NULL,
+          manifest_uri TEXT NOT NULL UNIQUE,
+          manifest_file_hash TEXT NOT NULL,
+          content_uri TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          canon_revision_id TEXT NOT NULL,
+          writing_pack_version TEXT NOT NULL,
+          source_revision_ids_json TEXT NOT NULL,
+          gate_snapshot_ids_json TEXT NOT NULL,
+          released_by TEXT NOT NULL,
+          released_at TEXT NOT NULL,
+          frozen_at TEXT NOT NULL,
+          FOREIGN KEY(manifest_uri) REFERENCES workspace_files(uri),
+          FOREIGN KEY(content_uri) REFERENCES workspace_files(uri)
+        )
+        """,
+        """
+        CREATE TABLE production_requests (
+          id TEXT PRIMARY KEY,
+          schema_version TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          request_uri TEXT NOT NULL UNIQUE,
+          request_file_hash TEXT NOT NULL,
+          release_id TEXT NOT NULL UNIQUE,
+          run_id TEXT NOT NULL UNIQUE,
+          production_display_name TEXT NOT NULL,
+          asset_manifest_id TEXT NOT NULL,
+          target TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(request_uri) REFERENCES workspace_files(uri),
+          FOREIGN KEY(release_id) REFERENCES frozen_script_releases(id),
+          FOREIGN KEY(run_id) REFERENCES production_runs(id),
+          FOREIGN KEY(asset_manifest_id) REFERENCES asset_manifests(id)
+        )
+        """,
+        "CREATE INDEX idx_frozen_script_releases_content_hash ON frozen_script_releases(content_hash)",
     ),
 }
 
@@ -866,6 +909,330 @@ class RuntimeStore:
                 (legacy_run_id,),
             ).fetchall()
             return [self._asset_manifest_payload(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _frozen_script_release_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": str(row["schema_version"]),
+            "id": str(row["id"]),
+            "work_id": str(row["work_id"]),
+            "display_version": str(row["display_version"]),
+            "manifest_uri": str(row["manifest_uri"]),
+            "manifest_file_hash": str(row["manifest_file_hash"]),
+            "content_uri": str(row["content_uri"]),
+            "content_hash": str(row["content_hash"]),
+            "canon_revision_id": str(row["canon_revision_id"]),
+            "writing_pack_version": str(row["writing_pack_version"]),
+            "source_revision_ids": _json_value(row["source_revision_ids_json"], []),
+            "gate_snapshot_ids": _json_value(row["gate_snapshot_ids_json"], []),
+            "released_by": str(row["released_by"]),
+            "released_at": str(row["released_at"]),
+            "frozen_at": str(row["frozen_at"]),
+        }
+
+    def register_frozen_script_release(
+        self,
+        payload: dict[str, Any],
+        *,
+        manifest_file_hash: str,
+    ) -> dict[str, Any]:
+        release_id = str(payload["id"])
+        manifest_uri = str(payload["manifest_uri"])
+        content_uri = str(payload["content_uri"])
+        with self._transaction() as connection:
+            manifest_file = connection.execute(
+                "SELECT content_hash FROM workspace_files WHERE uri=?",
+                (manifest_uri,),
+            ).fetchone()
+            content_file = connection.execute(
+                "SELECT content_hash FROM workspace_files WHERE uri=?",
+                (content_uri,),
+            ).fetchone()
+            if manifest_file is None or content_file is None:
+                raise ProductionError(
+                    "workspace_file_not_found",
+                    "ScriptRelease 引用的工作区文件尚未登记",
+                    status=404,
+                    details={"release_id": release_id},
+                )
+            if (
+                str(manifest_file["content_hash"]) != manifest_file_hash
+                or str(content_file["content_hash"]) != str(payload["content_hash"])
+            ):
+                raise ProductionError(
+                    "script_release_artifact_hash_mismatch",
+                    "ScriptRelease 引用的工作区文件哈希不一致",
+                    status=409,
+                    details={"release_id": release_id},
+                )
+            values = {
+                "schema_version": str(payload["schema_version"]),
+                "work_id": str(payload["work_id"]),
+                "display_version": str(payload["display_version"]),
+                "manifest_uri": manifest_uri,
+                "manifest_file_hash": manifest_file_hash,
+                "content_uri": content_uri,
+                "content_hash": str(payload["content_hash"]),
+                "canon_revision_id": str(payload["canon_revision_id"]),
+                "writing_pack_version": str(payload["writing_pack_version"]),
+                "source_revision_ids_json": _json(payload["source_revision_ids"]),
+                "gate_snapshot_ids_json": _json(payload["gate_snapshot_ids"]),
+                "released_by": str(payload["released_by"]),
+                "released_at": str(payload["released_at"]),
+            }
+            existing = connection.execute(
+                "SELECT * FROM frozen_script_releases WHERE id=?", (release_id,)
+            ).fetchone()
+            if existing is not None:
+                if any(str(existing[key]) != str(value) for key, value in values.items()):
+                    raise ProductionError(
+                        "script_release_identity_conflict",
+                        "同一 ScriptRelease ID 已冻结不同内容",
+                        status=409,
+                        details={"release_id": release_id},
+                    )
+                return self._frozen_script_release_payload(existing)
+            uri_owner = connection.execute(
+                "SELECT id FROM frozen_script_releases WHERE manifest_uri=?",
+                (manifest_uri,),
+            ).fetchone()
+            if uri_owner is not None:
+                raise ProductionError(
+                    "script_release_identity_conflict",
+                    "ScriptRelease 清单 URI 已属于其他发布版本",
+                    status=409,
+                    details={"release_id": release_id},
+                )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO frozen_script_releases(
+                      id, schema_version, work_id, display_version, manifest_uri,
+                      manifest_file_hash, content_uri, content_hash,
+                      canon_revision_id, writing_pack_version,
+                      source_revision_ids_json, gate_snapshot_ids_json,
+                      released_by, released_at, frozen_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        release_id,
+                        *values.values(),
+                        _now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ProductionError(
+                    "script_release_identity_conflict",
+                    "ScriptRelease 身份或工作区引用已被占用",
+                    status=409,
+                    details={"release_id": release_id},
+                ) from exc
+            row = connection.execute(
+                "SELECT * FROM frozen_script_releases WHERE id=?", (release_id,)
+            ).fetchone()
+            return self._frozen_script_release_payload(row)
+
+    def get_frozen_script_release(self, release_id: str) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM frozen_script_releases WHERE id=?", (release_id,)
+            ).fetchone()
+            return self._frozen_script_release_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _production_request_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "schema_version": str(row["schema_version"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "request_uri": str(row["request_uri"]),
+            "request_file_hash": str(row["request_file_hash"]),
+            "release_id": str(row["release_id"]),
+            "run_id": str(row["legacy_run_id"]),
+            "production_run_id": str(row["run_id"]),
+            "production_display_name": str(row["production_display_name"]),
+            "asset_manifest_id": str(row["asset_manifest_id"]),
+            "target": str(row["target"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _production_request_row(
+        connection: sqlite3.Connection, clause: str, value: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            f"""
+            SELECT requests.*, runs.legacy_run_id
+            FROM production_requests AS requests
+            JOIN production_runs AS runs ON runs.id=requests.run_id
+            WHERE requests.{clause}=?
+            """,
+            (value,),
+        ).fetchone()
+
+    def bind_production_request(
+        self,
+        *,
+        request_id: str,
+        schema_version: str,
+        idempotency_key: str,
+        request_uri: str,
+        request_file_hash: str,
+        release_id: str,
+        legacy_run_id: str,
+        production_display_name: str,
+        asset_manifest_id: str,
+        target: str,
+    ) -> dict[str, Any]:
+        with self._transaction() as connection:
+            request_file = connection.execute(
+                "SELECT content_hash FROM workspace_files WHERE uri=?",
+                (request_uri,),
+            ).fetchone()
+            if request_file is None:
+                raise ProductionError(
+                    "workspace_file_not_found",
+                    "ProductionRequest 工作区文件尚未登记",
+                    status=404,
+                    details={"request_id": request_id},
+                )
+            if str(request_file["content_hash"]) != request_file_hash:
+                raise ProductionError(
+                    "production_request_artifact_hash_mismatch",
+                    "ProductionRequest 文件哈希与工作区登记不一致",
+                    status=409,
+                    details={"request_id": request_id},
+                )
+            run = connection.execute(
+                "SELECT id FROM production_runs WHERE legacy_run_id=?",
+                (legacy_run_id,),
+            ).fetchone()
+            if run is None:
+                raise ProductionError("run_not_found", "制作任务不存在", status=404)
+            production_run_id = str(run["id"])
+            release = connection.execute(
+                "SELECT id FROM frozen_script_releases WHERE id=?", (release_id,)
+            ).fetchone()
+            if release is None:
+                raise ProductionError(
+                    "script_release_not_frozen",
+                    "ScriptRelease 尚未在制作端冻结",
+                    status=409,
+                    details={"release_id": release_id},
+                )
+            head = self._current_asset_manifest_row(connection, production_run_id)
+            if head is None or str(head["id"]) != asset_manifest_id:
+                raise ProductionError(
+                    "production_request_asset_manifest_conflict",
+                    "ProductionRun 当前素材清单与请求不一致",
+                    status=409,
+                    details={"request_id": request_id},
+                )
+            values = {
+                "schema_version": schema_version,
+                "idempotency_key": idempotency_key,
+                "request_uri": request_uri,
+                "request_file_hash": request_file_hash,
+                "release_id": release_id,
+                "run_id": production_run_id,
+                "production_display_name": production_display_name,
+                "asset_manifest_id": asset_manifest_id,
+                "target": target,
+            }
+            existing = self._production_request_row(connection, "id", request_id)
+            if existing is not None:
+                if any(str(existing[key]) != str(value) for key, value in values.items()):
+                    raise ProductionError(
+                        "production_request_identity_conflict",
+                        "同一 ProductionRequest ID 已绑定不同输入",
+                        status=409,
+                        details={"request_id": request_id},
+                    )
+                return self._production_request_payload(existing)
+            release_owner = self._production_request_row(
+                connection, "release_id", release_id
+            )
+            if release_owner is not None:
+                raise ProductionError(
+                    "production_request_conflict",
+                    "该 ScriptRelease 已由另一份 ProductionRequest 创建制作任务",
+                    status=409,
+                    details={
+                        "release_id": release_id,
+                        "existing_request_id": str(release_owner["id"]),
+                    },
+                )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO production_requests(
+                      id, schema_version, idempotency_key, request_uri,
+                      request_file_hash, release_id, run_id,
+                      production_display_name, asset_manifest_id, target, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        request_id,
+                        *values.values(),
+                        _now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ProductionError(
+                    "production_request_conflict",
+                    "ProductionRequest 身份或固定输入已被占用",
+                    status=409,
+                    details={"request_id": request_id, "release_id": release_id},
+                ) from exc
+            row = self._production_request_row(connection, "id", request_id)
+            return self._production_request_payload(row)
+
+    def get_production_request(self, request_id: str) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = self._production_request_row(connection, "id", request_id)
+            return self._production_request_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def get_production_request_for_release(
+        self, release_id: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = self._production_request_row(connection, "release_id", release_id)
+            return self._production_request_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def get_production_request_for_run(
+        self, legacy_run_id: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT requests.*, runs.legacy_run_id
+                FROM production_requests AS requests
+                JOIN production_runs AS runs ON runs.id=requests.run_id
+                WHERE runs.legacy_run_id=?
+                """,
+                (legacy_run_id,),
+            ).fetchone()
+            return self._production_request_payload(row) if row else None
         except sqlite3.DatabaseError as exc:
             raise self._database_error(exc) from exc
         finally:

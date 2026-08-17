@@ -10,6 +10,8 @@ It does not contain the writing backend. The integration boundary is a frozen
 ## Current vertical slice
 
 - Create and persist a `ProductionRun` from inline script text.
+- Create a persistent, idempotent formal run from `ProductionRequest/1.1` after
+  validating registered `ScriptRelease/1.1` content and `AssetManifest/1.0` artifacts.
 - Scan script structure and speakers with the 0.9.3 document parser.
 - Create a real 0.9.3-compatible `PerformanceDraft` in the 1.0 data directory.
 - Query production runs, work items, gates, cards, and diagnostics.
@@ -38,7 +40,8 @@ No 0.9.3 source or runtime data is modified.
 
 ## Persistent runtime
 
-`data/runtime.sqlite3` is the fact source for production runs, work items, job
+`data/runtime.sqlite3` is the fact source for production runs, frozen formal
+ScriptRelease copies, immutable ProductionRequest bindings, work items, job
 attempts, sequenced runtime events, and registered workspace files. The schema
 uses tracked, transactional migrations. Existing `data/runs/*.json` and
 `data/jobs/*.json` files are read only as one-way migration inputs; new state is
@@ -122,6 +125,13 @@ $body = @{
 Invoke-RestMethod -Method Post -ContentType application/json `
   -Body $body http://127.0.0.1:8892/api/v1/production-runs
 ```
+
+The same endpoint accepts the formal `ProductionRequest/1.1` example in
+`contracts/examples/production-request-1.1.json`. Its `ScriptRelease/1.1`
+manifest, explicit `content_uri`, and `AssetManifest/1.0` URI must already be
+registered in the local ArtifactStore. The service never derives script content
+from a neighboring filename or directory convention. `ProductionRequest/1.0`
+remains frozen for validation and audit but is not runnable.
 
 ## API contract
 

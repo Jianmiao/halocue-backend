@@ -8,6 +8,7 @@ import pytest
 
 from halocue_production.contracts import (
     CONTRACT_NAMES,
+    CONTRACT_VERSIONS,
     ContractValidationError,
     canonical_json_bytes,
     contract_content_hash,
@@ -30,10 +31,19 @@ EXAMPLES = {
     "ProductionEvent": "production-event-1.0.json",
     "ApiError": "api-error-1.0.json",
 }
+VERSIONED_EXAMPLES = {
+    ("ScriptRelease", "1.1"): "script-release-1.1.json",
+    ("ProductionRequest", "1.1"): "production-request-1.1.json",
+}
 
 
 def example(contract: str) -> dict:
     return json.loads((EXAMPLE_DIR / EXAMPLES[contract]).read_text(encoding="utf-8"))
+
+
+def versioned_example(contract: str, version: str) -> dict:
+    filename = VERSIONED_EXAMPLES[(contract, version)]
+    return json.loads((EXAMPLE_DIR / filename).read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("contract", CONTRACT_NAMES)
@@ -44,6 +54,16 @@ def test_formal_contract_example_round_trips_and_validates(contract):
 
     assert normalized == payload
     assert json.loads(json.dumps(normalized, ensure_ascii=False)) == payload
+    assert normalized is not payload
+
+
+@pytest.mark.parametrize(("contract", "version"), VERSIONED_EXAMPLES)
+def test_additive_contract_example_round_trips_and_validates(contract, version):
+    payload = versioned_example(contract, version)
+
+    normalized = validate_contract(contract, payload)
+
+    assert normalized == payload
     assert normalized is not payload
 
 
@@ -58,7 +78,10 @@ def test_formal_contract_rejects_unknown_version_consistently(contract):
     assert raised.value.code == "unsupported_contract_version"
     assert raised.value.contract == contract
     assert raised.value.path == "$.schema_version"
-    assert raised.value.details == {"received": "2.0", "supported": ["1.0"]}
+    assert raised.value.details == {
+        "received": "2.0",
+        "supported": list(CONTRACT_VERSIONS[contract]),
+    }
 
 
 @pytest.mark.parametrize("contract", CONTRACT_NAMES)
@@ -132,6 +155,46 @@ def test_formal_contract_rejects_bare_hash():
 
     assert raised.value.path == "$.content_hash"
     assert "sha256:<64 lowercase hex>" in str(raised.value)
+
+
+def test_script_release_1_1_requires_explicit_content_uri():
+    payload = versioned_example("ScriptRelease", "1.1")
+    del payload["content_uri"]
+
+    with pytest.raises(ContractValidationError) as raised:
+        validate_contract("ScriptRelease", payload)
+
+    assert raised.value.path == "$"
+    assert "content_uri" in str(raised.value)
+
+
+def test_script_release_1_0_remains_frozen_without_content_uri():
+    payload = example("ScriptRelease")
+    payload["content_uri"] = "workspace://releases/legacy/script.txt"
+
+    with pytest.raises(ContractValidationError) as raised:
+        validate_contract("ScriptRelease", payload)
+
+    assert raised.value.path == "$"
+    assert "unknown fields: content_uri" in str(raised.value)
+
+
+def test_production_request_1_1_requires_release_1_1_and_display_name():
+    payload = versioned_example("ProductionRequest", "1.1")
+    del payload["production_display_name"]
+
+    with pytest.raises(ContractValidationError) as raised:
+        validate_contract("ProductionRequest", payload)
+
+    assert raised.value.path == "$"
+    assert "production_display_name" in str(raised.value)
+
+    payload = versioned_example("ProductionRequest", "1.1")
+    payload["script_release"]["version"] = "1.0"
+    payload["idempotency_key"] = idempotency_key_for_request(payload)
+    with pytest.raises(ContractValidationError) as raised:
+        validate_contract("ProductionRequest", payload)
+    assert raised.value.path == "$.script_release.version"
 
 
 def test_formal_contract_rejects_path_traversal_uri():
@@ -265,6 +328,12 @@ def test_envelope_hash_vectors_match_examples(contract):
 
 def test_production_request_idempotency_vector_matches_example():
     payload = example("ProductionRequest")
+
+    assert idempotency_key_for_request(payload) == payload["idempotency_key"]
+
+
+def test_production_request_1_1_idempotency_vector_matches_example():
+    payload = versioned_example("ProductionRequest", "1.1")
 
     assert idempotency_key_for_request(payload) == payload["idempotency_key"]
 

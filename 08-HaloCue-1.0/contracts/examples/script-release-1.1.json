@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.1",
+  "id": "11111111-1111-4111-8111-111111111111",
+  "work_id": "22222222-2222-4222-8222-222222222222",
+  "display_version": "v4",
+  "manifest_uri": "workspace://releases/11111111-1111-4111-8111-111111111111/manifest.json",
+  "content_uri": "workspace://releases/11111111-1111-4111-8111-111111111111/script.txt",
+  "content_hash": "sha256:f63e8648ba826028afa364f9172f1559c8fdddbe87f6ef7badf79f43b0aca2c7",
+  "canon_revision_id": "33333333-3333-4333-8333-333333333333",
+  "writing_pack_version": "ba-writing.productized/1.0.0",
+  "source_revision_ids": [
+    "44444444-4444-4444-8444-444444444444"
+  ],
+  "gate_snapshot_ids": [
+    "55555555-5555-4555-8555-555555555555"
+  ],
+  "released_by": "user:local",
+  "released_at": "2026-08-15T04:00:00Z"
+}

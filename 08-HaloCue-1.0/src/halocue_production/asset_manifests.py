@@ -236,6 +236,72 @@ class AssetManifestStore:
             )
             return self._description(binding, normalized)
 
+    def freeze_reference(
+        self,
+        run: ProductionRun,
+        reference: dict[str, Any],
+        *,
+        source_kind: str = "production_request",
+    ) -> dict[str, Any]:
+        """Bind an already registered formal AssetManifest to a ProductionRun."""
+        with self._lock:
+            if source_kind not in _SOURCE_KINDS:
+                raise ProductionError(
+                    "asset_manifest_source_invalid",
+                    "AssetManifest 冻结来源无效",
+                    status=400,
+                )
+            normalized, artifact = self._reference_payload(reference)
+            binding = self.runtime.bind_asset_manifest(
+                legacy_run_id=run.run_id,
+                manifest_id=normalized["id"],
+                workspace_uri=artifact.uri,
+                content_hash=normalized["content_hash"],
+                file_hash=artifact.content_hash,
+                source_kind=source_kind,
+                created_at=normalized["created_at"],
+            )
+            return self._description(binding, normalized)
+
+    def validate_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            normalized, _ = self._reference_payload(reference)
+            return normalized
+
+    def _reference_payload(
+        self, reference: dict[str, Any]
+    ) -> tuple[dict[str, Any], Any]:
+        if reference.get("version") != "1.0":
+            raise ProductionError(
+                "unsupported_asset_manifest_version",
+                "正式制作入口只接受 AssetManifest/1.0",
+                status=400,
+            )
+        artifact = self.artifacts.get(str(reference.get("uri") or ""))
+        content = self.artifacts.read_bytes(artifact.uri)
+        try:
+            raw = json.loads(content.decode("utf-8"))
+            normalized = validate_contract("AssetManifest", raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, ContractValidationError) as exc:
+            raise ProductionError(
+                "asset_manifest_invalid",
+                "AssetManifest 引用的工作区文件不符合 1.0 合同",
+                status=422,
+            ) from exc
+        expected = {
+            "id": str(reference.get("id") or ""),
+            "content_hash": str(reference.get("content_hash") or ""),
+        }
+        if any(normalized[key] != value for key, value in expected.items()):
+            raise ProductionError(
+                "asset_manifest_reference_mismatch",
+                "ProductionRequest 中的素材清单引用与文件内容不一致",
+                status=409,
+                details={"manifest_id": expected["id"]},
+            )
+        self._verify_allowlisted_assets(normalized)
+        return normalized, artifact
+
     def _commit_manifest(
         self,
         run: ProductionRun,

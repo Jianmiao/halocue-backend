@@ -1,10 +1,10 @@
 # HaloCue 1.0 核心合同包
 
-状态：B0 的 1.0 冻结基线。本目录的八份 JSON 是正式领域合同样例，可执行规则位于 `src/halocue_production/contracts.py`。当前 AA 兼容 HTTP payload 仍由防腐层处理，不属于这些样例的替代响应。后续不兼容变更必须使用新的合同版本，不能静默改写 1.0 样例或哈希规则。
+状态：B0 的 1.0 冻结基线，以及 B2 经产品确认的 ScriptRelease/ProductionRequest 1.1 增量合同。本目录的 JSON 是正式领域合同样例，可执行规则位于 `src/halocue_production/contracts.py`。当前 AA 兼容 HTTP payload 仍由防腐层处理，不属于这些样例的替代响应。后续不兼容变更必须使用新的合同版本，不能静默改写 1.0 样例或哈希规则。
 
 ## 通用规则
 
-- 每份 payload 必须包含 `schema_version: "1.0"`。
+- 每份 payload 必须包含明确的 `schema_version`。除 ScriptRelease 和 ProductionRequest 同时支持冻结的 `1.0` 与增量 `1.1` 外，其余六份合同当前只支持 `1.0`。
 - 正式持久对象使用 canonical UUID；现有 `release-xxxxxxxxxxxx` 等 ID 只能在兼容边界转换。
 - 哈希统一使用 `sha256:<64 lowercase hex>`。
 - 文件和产物仅使用 `workspace://` 或 `artifact://` URI，不允许系统路径、反斜杠或 `..` 穿越。
@@ -15,8 +15,8 @@
 
 | 合同 | 样例 | 边界 |
 |---|---|---|
-| `ScriptRelease/1.0` | `examples/script-release-1.0.json` | 写作域拥有的不可变发布清单 |
-| `ProductionRequest/1.0` | `examples/production-request-1.0.json` | 制作 Run 的固定输入、白名单和策略 |
+| `ScriptRelease/1.0`, `1.1` | `examples/script-release-1.0.json`, `script-release-1.1.json` | 写作域拥有的不可变发布清单；1.1 显式携带正文 Artifact URI |
+| `ProductionRequest/1.0`, `1.1` | `examples/production-request-1.0.json`, `production-request-1.1.json` | 制作 Run 的固定输入、白名单和策略；1.1 增加非身份制作显示名并引用 ScriptRelease/1.1 |
 | `PerformanceDraft/1.0` | `examples/performance-draft-1.0.json` | 与 AA/StoryForge 无关的标准演出模型 |
 | `AssetManifest/1.0` | `examples/asset-manifest-1.0.json` | 任务冻结素材白名单 |
 | `AdapterCapabilities/1.0` | `examples/adapter-capabilities-1.0.json` | 适配器、引擎、目标和合同版本发现 |
@@ -46,19 +46,17 @@
 
 - 现有 `WRITING_HANDOFF_CONTRACT.md` 的 payload 标记为 `WritingHandoff/1.0`，不是正式 `ScriptRelease/1.0`。
 - 兼容交接继续验证冻结正文哈希、幂等和同 ID 异哈希冲突，但不伪造 UUID、manifest URI、Revision 或 Gate 快照。
-- 正式入口只能接受完整 `ScriptRelease/1.0`；缺少字段时结构化拒绝，不从标题、文件名或数组位置推导。
+- 正式可运行入口只接受完整 `ProductionRequest/1.1` 和 `ScriptRelease/1.1`；缺少字段时结构化拒绝，不从标题、文件名或数组位置推导。
 - 未来转换层必须保留两种合同身份和原始哈希，不就地覆盖兼容记录。
 
-## ProductionRequest 运行时入口缺口
+## ProductionRequest 1.1 运行时入口
 
-`ProductionRequest/1.0` 当前只引用 ScriptRelease 的 `manifest_uri` 和正文
-哈希；`ScriptRelease/1.0` 清单不包含正文 Artifact 的 URI，
-`ProductionRequest/1.0` 也不包含制作工程展示名。因此当前不从
-`manifest_uri` 的文件名或目录布局猜测正文，也不把展示版本当成工程身份。
-在正式 HTTP 入口可创建可制作 Run 之前，需要产品负责人选择并冻结下列一种方案：
+产品决定采用显式引用方案，不冻结隐式目录布局：
 
-- 新增带显式 `content_uri` 的 `ScriptRelease/1.1`；或
-- 冻结一份版本化的本地工作区布局合同，并为制作展示名增加独立、非身份字段。
+- `ScriptRelease/1.1` 增加 `content_uri`，其 `content_hash` 仍对该 URI 指向的冻结正文文件字节求哈希。
+- `ProductionRequest/1.1` 增加非身份字段 `production_display_name`，并以 `script_release.version: "1.1"`、`manifest_uri`、`content_uri` 和哈希固定上游输入。
+- `ProductionRequest/1.0` 与 `ScriptRelease/1.0` 样例继续可校验和审计，但 1.0 请求不能创建正式 ProductionRun；运行时返回稳定的 `production_request_version_not_runnable`。
+- HTTP 正式入口要求所有引用 URI 已登记到同一本地 ArtifactStore。制作端重新校验 URI、文件哈希、完整 ScriptRelease 清单和 AssetManifest 后，才创建 Draft/Run，并在 SQLite 中保存冻结发布副本和不可变请求绑定。
+- 同一 request ID 不同 envelope 返回 `production_request_identity_conflict`；同一 release ID 不同正文哈希返回 `script_release_identity_conflict`；完全相同的 1.1 请求幂等返回原 Run。
 
-这一缺口不影响现有 `WritingHandoff/1.0` 兼容路线，也不影响
-AssetManifest 冻结、后继版本和白名单阻断。
+现有 `WritingHandoff/1.0` 兼容路线保持不变。写作和制作组合层在共享 ArtifactStore 与正式 UUID 身份前，不把兼容 payload 冒充为 1.1。

@@ -68,6 +68,8 @@ def test_runtime_store_creates_current_schema(tmp_path):
         "asset_manifests",
         "production_run_asset_manifest_history",
         "production_run_asset_manifest_heads",
+        "frozen_script_releases",
+        "production_requests",
     } <= tables
 
 
@@ -156,6 +158,62 @@ def test_runtime_store_upgrades_v4_manifest_binding_to_versioned_history(tmp_pat
     assert current["revision"] == 1
     assert current["production_run_id"] == production_run_id
     assert history == [current]
+
+
+def test_runtime_store_upgrades_v5_to_current_with_formal_input_tables(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=5)
+    production_run_id, _ = legacy.save_production_run(legacy_run_payload())
+
+    upgraded = RuntimeStore(path)
+
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert upgraded.get_production_run("run-000000000001")[
+        "production_run_id"
+    ] == production_run_id
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        release_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(frozen_script_releases)"
+            )
+        }
+        request_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(production_requests)"
+            )
+        }
+        applied = {
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM runtime_schema_migrations"
+            )
+        }
+
+    assert {"frozen_script_releases", "production_requests"} <= tables
+    assert {
+        "id",
+        "manifest_uri",
+        "content_uri",
+        "content_hash",
+        "manifest_file_hash",
+    } <= release_columns
+    assert {
+        "id",
+        "idempotency_key",
+        "request_uri",
+        "request_file_hash",
+        "release_id",
+        "run_id",
+    } <= request_columns
+    assert 6 in applied
 
 
 def test_runtime_store_rejects_newer_schema_version(tmp_path):

@@ -4,6 +4,7 @@ import datetime as dt
 import io
 import mimetypes
 import re
+import threading
 import uuid
 import zipfile
 from dataclasses import replace
@@ -16,6 +17,7 @@ from .contracts import canonical_json_bytes, contract_content_hash, sha256_bytes
 from .config import Settings
 from .direction_models import CancellableModelProvider, DirectionModelGateway
 from .errors import ProductionError
+from .formal_inputs import FormalProductionInputs
 from .jobs import CancellationToken, JobOutcome, JobRegistry
 from .legacy_adapter import Legacy093Adapter
 from .models import ProductionRun, ScriptRelease, WorkItem, content_sha256, new_id, utc_now
@@ -60,7 +62,17 @@ class ProductionService:
         self.asset_manifests = AssetManifestStore(
             self.artifacts, self.repository.runtime
         )
+        self.formal_inputs = FormalProductionInputs(
+            self.artifacts, self.repository.runtime
+        )
+        self._formal_request_lock = threading.RLock()
         for existing_run in self.repository.list_runs():
+            formal_request = existing_run.source_summary.get("production_request")
+            if (
+                isinstance(formal_request, dict)
+                and formal_request.get("contract_kind") == "ProductionRequest/1.1"
+            ):
+                continue
             self.asset_manifests.ensure_compatibility_manifest(existing_run)
         self.settings_store = SettingsStore(settings.data_dir)
         persisted = self.settings_store.load()
@@ -182,8 +194,10 @@ class ProductionService:
             "state": "available",
             "schema_version": "1.0",
             "contract_kind": "WritingHandoff/1.0",
-            "formal_contract": "ScriptRelease/1.0",
-            "formal_contract_state": "not_connected",
+            "formal_contract": "ScriptRelease/1.1",
+            "formal_request": "ProductionRequest/1.1",
+            "formal_contract_state": "available",
+            "content_transport": "registered_workspace_uri",
             "identity_fields": ["id", "display_version", "content_hash"],
             "content_hash": "sha256",
             "idempotent": True,
@@ -988,6 +1002,12 @@ class ProductionService:
         return {"ok": True, "run_id": run_id, "usage": usage}
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "schema_version" in payload:
+            with self._formal_request_lock:
+                return self._create_formal_run(payload)
+        return self._create_compatibility_run(payload)
+
+    def _create_compatibility_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         generation_mode = str(payload.get("generation_mode") or "format_only").strip()
         if generation_mode not in {"format_only", "ai_direction"}:
             raise ProductionError(
@@ -1017,13 +1037,45 @@ class ProductionService:
                 return result
         release = ScriptRelease.create(project, text, source_kind)
         self.repository.save_release(release, text)
+        run = self._initialize_run(
+            project=project,
+            text=text,
+            source_kind=source_kind,
+            source_filename=source_filename,
+            release_id=release.release_id,
+            generation_mode=generation_mode,
+            upstream_release=upstream_release,
+        )
+        self.asset_manifests.ensure_compatibility_manifest(run)
+        result = self.run_detail(run.run_id)
+        if upstream_release:
+            result["handoff"] = {
+                "kind": "script_release",
+                "idempotent": False,
+                "upstream_release": upstream_release,
+            }
+        return result
 
+    def _initialize_run(
+        self,
+        *,
+        project: str,
+        text: str,
+        source_kind: str,
+        source_filename: str | None,
+        release_id: str,
+        generation_mode: str,
+        upstream_release: dict[str, Any] | None,
+        production_request: dict[str, Any] | None = None,
+    ) -> ProductionRun:
         summary = self.adapter.inspect_script(text)
         summary["source_kind"] = source_kind
         if source_filename:
             summary["source_filename"] = source_filename
         if upstream_release:
             summary["upstream_release"] = upstream_release
+        if production_request:
+            summary["production_request"] = production_request
         draft = self.adapter.create_performance_draft(
             project=project,
             text=text,
@@ -1034,7 +1086,7 @@ class ProductionService:
         run = ProductionRun(
             run_id=new_id("run"),
             project=project,
-            release_id=release.release_id,
+            release_id=release_id,
             draft_token=draft["session"]["draft_token"],
             state="waiting_for_review",
             current_stage="preflight",
@@ -1050,14 +1102,79 @@ class ProductionService:
         )
         run.source_summary["generation_mode"] = generation_mode
         self.repository.save_run(run)
-        self.asset_manifests.ensure_compatibility_manifest(run)
-        result = self.run_detail(run.run_id)
-        if upstream_release:
+        return run
+
+    def _create_formal_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = self.formal_inputs.validate_request(payload)
+        existing_request = self.formal_inputs.existing_request(request)
+        if existing_request is not None:
+            result = self.run_detail(existing_request["run_id"])
             result["handoff"] = {
-                "kind": "script_release",
-                "idempotent": False,
-                "upstream_release": upstream_release,
+                "kind": "production_request",
+                "idempotent": True,
+                "request_id": request["request_id"],
+                "release_id": request["script_release"]["id"],
             }
+            return result
+
+        self.asset_manifests.validate_reference(request["asset_manifest"])
+        release, text = self.formal_inputs.freeze_script_release(request)
+        project = self._project_name(request["production_display_name"])
+        upstream_release = {
+            "kind": "halocue_writing",
+            "contract_kind": "ScriptRelease/1.1",
+            "formal_script_release": True,
+            "schema_version": release["schema_version"],
+            "release_id": release["id"],
+            "work_id": release["work_id"],
+            "display_version": release["display_version"],
+            "content_hash": release["content_hash"],
+            "manifest_uri": release["manifest_uri"],
+            "content_uri": release["content_uri"],
+            "writing_pack_version": release["writing_pack_version"],
+        }
+        request_summary = {
+            "contract_kind": "ProductionRequest/1.1",
+            "schema_version": request["schema_version"],
+            "request_id": request["request_id"],
+            "idempotency_key": request["idempotency_key"],
+            "asset_manifest_id": request["asset_manifest"]["id"],
+            "target": request["production_policy"]["target"],
+        }
+        run = self._run_for_upstream_release(upstream_release)
+        if run is not None:
+            pending = run.source_summary.get("production_request")
+            if not isinstance(pending, dict) or any(
+                pending.get(key) != request_summary[key]
+                for key in ("request_id", "idempotency_key", "asset_manifest_id", "target")
+            ):
+                raise ProductionError(
+                    "production_request_conflict",
+                    "该 ScriptRelease 已由另一份 ProductionRequest 创建制作任务",
+                    status=409,
+                    details={"release_id": release["id"], "run_id": run.run_id},
+                )
+        else:
+            run = self._initialize_run(
+                project=project,
+                text=text,
+                source_kind="script_release",
+                source_filename=None,
+                release_id=release["id"],
+                generation_mode="format_only",
+                upstream_release=upstream_release,
+                production_request=request_summary,
+            )
+        self.asset_manifests.freeze_reference(run, request["asset_manifest"])
+        request_description = self.formal_inputs.bind_request(request, run)
+        result = self.run_detail(run.run_id)
+        result["production_request"] = request_description
+        result["handoff"] = {
+            "kind": "production_request",
+            "idempotent": False,
+            "request_id": request["request_id"],
+            "release_id": release["id"],
+        }
         return result
 
     def _run_for_upstream_release(
@@ -1145,7 +1262,7 @@ class ProductionService:
         draft = self.adapter.draft_detail(str(run.draft_token)) if run.draft_token else None
         gates = self._gates(run, draft)
         manifest = self.asset_manifests.describe_for_run(run_id)
-        return {
+        result = {
             "ok": True,
             "run": run.to_dict(),
             "gates": gates,
@@ -1153,6 +1270,10 @@ class ProductionService:
             "asset_manifest": manifest["reference"],
             "asset_policy": manifest["policy"],
         }
+        production_request = self.formal_inputs.describe_for_run(run_id)
+        if production_request is not None:
+            result["production_request"] = production_request
+        return result
 
     def performance_preview(self, run_id: str) -> dict[str, Any]:
         """Build a read-only, task-local representation for the draft preview.

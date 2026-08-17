@@ -9,6 +9,7 @@ from contextlib import contextmanager
 
 from halocue_production.app import create_server
 from halocue_production.service import ProductionService
+from test_formal_inputs import formal_request
 from test_service import configured_resource_settings
 from PIL import Image
 from io import BytesIO
@@ -51,6 +52,46 @@ def upload(base: str, path: str, filename: str, content: bytes):
     )
     with urllib.request.urlopen(req, timeout=5) as response:
         return response.status, dict(response.headers), json.loads(response.read())
+
+
+def test_http_accepts_idempotent_production_request_1_1(settings):
+    staging = ProductionService(settings)
+    payload = formal_request(staging)
+    staging.jobs.close()
+
+    with api(settings) as base:
+        status, _, created = request(
+            base, "/api/v1/production-runs", payload, "POST"
+        )
+        assert status == 201
+        assert created["production_request"]["version"] == "1.1"
+        assert created["handoff"]["idempotent"] is False
+        assert str(settings.data_dir) not in json.dumps(created, ensure_ascii=False)
+
+        status, _, repeated = request(
+            base, "/api/v1/production-runs", payload, "POST"
+        )
+        assert status == 200
+        assert repeated["run"]["run_id"] == created["run"]["run_id"]
+        assert repeated["handoff"]["idempotent"] is True
+
+
+def test_http_maps_formal_request_version_error_to_stable_api_error(settings):
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/production-runs",
+            {"schema_version": "2.0"},
+            "POST",
+        )
+
+    assert status == 400
+    assert result["ok"] is False
+    assert result["error"]["code"] == "unsupported_production_request_version"
+    assert result["error"]["details"]["path"] == "$.schema_version"
+    assert result["error"]["details"]["received"] == "2.0"
+    assert "supported" in result["error"]["details"]
+    assert "data_dir" not in json.dumps(result, ensure_ascii=False)
 
 
 def test_http_vertical_slice_and_error_contract(settings):
