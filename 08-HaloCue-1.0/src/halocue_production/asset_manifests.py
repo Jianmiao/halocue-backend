@@ -18,7 +18,9 @@ from .runtime import RuntimeStore
 
 
 _MANIFEST_NAMESPACE = uuid.UUID("63e78d19-fdac-4ac1-9804-da72f134a7a0")
-_SOURCE_KINDS = frozenset({"compatibility_empty", "production_request"})
+_SOURCE_KINDS = frozenset(
+    {"compatibility_empty", "production_request", "task_asset_upgrade"}
+)
 
 
 class AssetManifestStore:
@@ -140,12 +142,111 @@ class AssetManifestStore:
             current = self._load(existing)
             return self._description(existing, current)
         self._verify_allowlisted_assets(normalized)
-        uri = f'workspace://assets/{normalized["id"]}/manifest.json'
-        content = canonical_json_bytes(normalized)
+        uri, artifact = self._commit_manifest(run, normalized, source_kind)
+        binding = self.runtime.bind_asset_manifest(
+            legacy_run_id=run.run_id,
+            manifest_id=normalized["id"],
+            workspace_uri=uri,
+            content_hash=normalized["content_hash"],
+            file_hash=artifact.content_hash,
+            source_kind=source_kind,
+            created_at=normalized["created_at"],
+        )
+        return self._description(binding, normalized)
+
+    def advance(
+        self,
+        run: ProductionRun,
+        payload: dict[str, Any],
+        *,
+        expected_manifest_id: str,
+        expected_content_hash: str,
+        source_kind: str,
+        selection_kind: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            persisted_run = self.runtime.get_production_run(run.run_id)
+            if (
+                persisted_run is None
+                or not run.production_run_id
+                or persisted_run["production_run_id"] != run.production_run_id
+            ):
+                raise ProductionError(
+                    "production_run_identity_invalid",
+                    "只能为已持久化的制作任务升级 AssetManifest",
+                    status=409,
+                    details={"run_id": run.run_id},
+                )
+            if source_kind not in _SOURCE_KINDS:
+                raise ProductionError(
+                    "asset_manifest_source_invalid",
+                    "AssetManifest 冻结来源无效",
+                    status=400,
+                )
+            try:
+                normalized = validate_contract("AssetManifest", payload)
+            except ContractValidationError as exc:
+                raise ProductionError(
+                    "asset_manifest_invalid",
+                    "AssetManifest 不符合 1.0 合同",
+                    status=422,
+                    details={"path": exc.path, "reason": str(exc)},
+                ) from exc
+            current_binding = self.runtime.get_asset_manifest_for_run(run.run_id)
+            if current_binding is None:
+                raise ProductionError(
+                    "asset_manifest_not_found",
+                    "制作任务尚未冻结 AssetManifest",
+                    status=409,
+                    details={"run_id": run.run_id},
+                )
+            if (
+                current_binding["id"] != expected_manifest_id
+                or current_binding["content_hash"] != expected_content_hash
+            ):
+                if (
+                    current_binding["id"] == normalized["id"]
+                    and current_binding["content_hash"] == normalized["content_hash"]
+                ):
+                    current = self._load(current_binding)
+                    return self._description(current_binding, current)
+                raise ProductionError(
+                    "asset_manifest_revision_conflict",
+                    "AssetManifest 已被其他操作升级",
+                    status=409,
+                    details={
+                        "run_id": run.run_id,
+                        "current_manifest_id": current_binding["id"],
+                        "current_content_hash": current_binding["content_hash"],
+                    },
+                )
+            self._verify_allowlisted_assets(normalized)
+            uri, artifact = self._commit_manifest(run, normalized, source_kind)
+            binding = self.runtime.advance_asset_manifest(
+                legacy_run_id=run.run_id,
+                expected_manifest_id=expected_manifest_id,
+                expected_content_hash=expected_content_hash,
+                manifest_id=normalized["id"],
+                workspace_uri=uri,
+                content_hash=normalized["content_hash"],
+                file_hash=artifact.content_hash,
+                source_kind=source_kind,
+                created_at=normalized["created_at"],
+                selection_kind=selection_kind,
+            )
+            return self._description(binding, normalized)
+
+    def _commit_manifest(
+        self,
+        run: ProductionRun,
+        payload: dict[str, Any],
+        source_kind: str,
+    ) -> tuple[str, Any]:
+        uri = f'workspace://assets/{payload["id"]}/manifest.json'
         try:
             artifact = self.artifacts.commit_bytes(
                 uri,
-                content,
+                canonical_json_bytes(payload),
                 kind="asset-manifest",
                 media_type="application/json",
                 metadata={
@@ -161,18 +262,9 @@ class AssetManifestStore:
                 "asset_manifest_conflict",
                 "AssetManifest 工作区 URI 已存在不同内容",
                 status=409,
-                details={"run_id": run.run_id, "manifest_id": normalized["id"]},
+                details={"run_id": run.run_id, "manifest_id": payload["id"]},
             ) from exc
-        binding = self.runtime.bind_asset_manifest(
-            legacy_run_id=run.run_id,
-            manifest_id=normalized["id"],
-            workspace_uri=uri,
-            content_hash=normalized["content_hash"],
-            file_hash=artifact.content_hash,
-            source_kind=source_kind,
-            created_at=normalized["created_at"],
-        )
-        return self._description(binding, normalized)
+        return uri, artifact
 
     def describe_for_run(self, legacy_run_id: str) -> dict[str, Any]:
         binding = self.runtime.get_asset_manifest_for_run(legacy_run_id)
@@ -185,6 +277,32 @@ class AssetManifestStore:
             )
         payload = self._load(binding)
         return self._description(binding, payload)
+
+    def payload_for_run(self, legacy_run_id: str) -> dict[str, Any]:
+        binding = self.runtime.get_asset_manifest_for_run(legacy_run_id)
+        if binding is None:
+            raise ProductionError(
+                "asset_manifest_not_found",
+                "制作任务尚未冻结 AssetManifest",
+                status=500,
+                details={"run_id": legacy_run_id},
+            )
+        return self._load(binding)
+
+    def history_for_run(self, legacy_run_id: str) -> list[dict[str, Any]]:
+        values = []
+        for binding in self.runtime.list_asset_manifests_for_run(legacy_run_id):
+            payload = self._load(binding)
+            description = self._description(binding, payload)
+            values.append(
+                {
+                    **description,
+                    "predecessor_manifest_id": binding["predecessor_manifest_id"],
+                    "selection_kind": binding["selection_kind"],
+                    "selected_at": binding["selected_at"],
+                }
+            )
+        return values
 
     def require_asset(self, legacy_run_id: str, asset_id: str) -> dict[str, Any]:
         binding = self.runtime.get_asset_manifest_for_run(legacy_run_id)
@@ -263,5 +381,6 @@ class AssetManifestStore:
                 "mode": "whitelist_only",
                 "source": binding["source_kind"],
                 "asset_count": len(payload["assets"]),
+                "revision": int(binding["revision"]),
             },
         }

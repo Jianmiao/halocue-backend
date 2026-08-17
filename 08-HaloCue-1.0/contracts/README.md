@@ -48,3 +48,17 @@
 - 兼容交接继续验证冻结正文哈希、幂等和同 ID 异哈希冲突，但不伪造 UUID、manifest URI、Revision 或 Gate 快照。
 - 正式入口只能接受完整 `ScriptRelease/1.0`；缺少字段时结构化拒绝，不从标题、文件名或数组位置推导。
 - 未来转换层必须保留两种合同身份和原始哈希，不就地覆盖兼容记录。
+
+## ProductionRequest 运行时入口缺口
+
+`ProductionRequest/1.0` 当前只引用 ScriptRelease 的 `manifest_uri` 和正文
+哈希；`ScriptRelease/1.0` 清单不包含正文 Artifact 的 URI，
+`ProductionRequest/1.0` 也不包含制作工程展示名。因此当前不从
+`manifest_uri` 的文件名或目录布局猜测正文，也不把展示版本当成工程身份。
+在正式 HTTP 入口可创建可制作 Run 之前，需要产品负责人选择并冻结下列一种方案：
+
+- 新增带显式 `content_uri` 的 `ScriptRelease/1.1`；或
+- 冻结一份版本化的本地工作区布局合同，并为制作展示名增加独立、非身份字段。
+
+这一缺口不影响现有 `WritingHandoff/1.0` 兼容路线，也不影响
+AssetManifest 冻结、后继版本和白名单阻断。

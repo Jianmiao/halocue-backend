@@ -601,6 +601,52 @@ class Legacy093Adapter:
     def list_task_assets(self, token: str) -> list[dict[str, Any]]:
         return [self.task_asset_public(item) for item in self._task_custom_assets(token)]
 
+    def task_asset_record(self, token: str, asset_id: str) -> tuple[dict[str, Any], Path]:
+        if not re.fullmatch(r"asset-[0-9a-f]{12}", str(asset_id)):
+            raise ProductionError("invalid_task_asset_id", "素材标识无效")
+        record = next(
+            (
+                item
+                for item in self._task_custom_assets(token)
+                if isinstance(item, dict) and item.get("asset_id") == asset_id
+            ),
+            None,
+        )
+        if record is None:
+            raise ProductionError(
+                "task_asset_not_found", "当前任务没有这条自定义素材", status=404
+            )
+        draft_dir = self.store.get_draft_path(token).resolve()
+        asset_root = (draft_dir / "custom-assets" / asset_id).resolve()
+        try:
+            asset_root.relative_to(draft_dir)
+        except ValueError as exc:
+            raise ProductionError(
+                "task_asset_corrupt", "任务素材存储位置无效", status=500
+            ) from exc
+        kind = str(record.get("kind") or "")
+        if kind == "character":
+            source = asset_root
+            valid = source.is_dir() and not source.is_symlink()
+        else:
+            try:
+                files = [
+                    item
+                    for item in asset_root.iterdir()
+                    if item.is_file() and not item.is_symlink()
+                ]
+            except OSError as exc:
+                raise ProductionError(
+                    "task_asset_corrupt", "任务素材内容无法读取", status=500
+                ) from exc
+            source = files[0] if len(files) == 1 else asset_root
+            valid = len(files) == 1
+        if not valid:
+            raise ProductionError(
+                "task_asset_corrupt", "任务素材内容不完整", status=500
+            )
+        return dict(record), source
+
     def remove_task_asset(
         self, *, token: str, asset_id: str, expected_draft_version: int
     ) -> dict[str, Any]:

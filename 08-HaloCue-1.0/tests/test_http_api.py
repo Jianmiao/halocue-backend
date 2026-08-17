@@ -272,6 +272,26 @@ def test_http_task_asset_upload_validate_register_and_preview(settings, tmp_path
         assert status == 201
         assert registered["asset"]["key"] == "scene"
         assert "private_source" not in registered["asset"]
+        status, _, upgraded = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/asset-manifests",
+            {
+                "expected_manifest_id": created["asset_manifest"]["id"],
+                "expected_content_hash": created["asset_manifest"]["content_hash"],
+                "add_task_asset_ids": [registered["asset"]["asset_id"]],
+                "remove_task_asset_ids": [],
+            },
+            "POST",
+        )
+        assert status == 201
+        assert upgraded["asset_policy"]["revision"] == 2
+        assert upgraded["asset_policy"]["asset_count"] == 1
+        assert "path" not in json.dumps(upgraded, ensure_ascii=False)
+        status, _, history = request(
+            base, f"/api/v1/production-runs/{run_id}/asset-manifests"
+        )
+        assert status == 200
+        assert [item["asset_policy"]["revision"] for item in history["items"]] == [1, 2]
         with urllib.request.urlopen(
             base + f"/api/v1/production-runs/{run_id}/resources/backgrounds/scene/preview", timeout=5
         ) as response:
@@ -288,6 +308,7 @@ def test_http_task_asset_upload_validate_register_and_preview(settings, tmp_path
             "DELETE",
         )
         assert status == 200
+        assert removed["asset_manifest_upgrade_required"] is True
         assert removed["draft"]["draft_version"] == registered["draft"]["draft_version"] + 1
         status, _, assets = request(base, f"/api/v1/production-runs/{run_id}/assets")
         assert status == 200

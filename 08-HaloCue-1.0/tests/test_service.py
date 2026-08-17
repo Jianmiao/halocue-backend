@@ -6,6 +6,8 @@ import os
 import time
 import threading
 import uuid
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -205,6 +207,109 @@ def test_task_asset_registration_is_isolated_and_updates_frozen_resources(settin
     preview = service.run_resource_preview(created["run"]["run_id"], "backgrounds", "自定义背景")
     assert preview.path.is_file()
     service.jobs.close()
+
+
+def test_task_asset_requires_explicit_manifest_successor_before_validation(
+    settings, tmp_path
+):
+    configured = configured_resource_settings(settings, tmp_path)
+    service = ProductionService(configured)
+    created = service.create_run(
+        {
+            "project": "素材白名单升级",
+            "source": {"kind": "inline", "text": "旁白: 测试\n"},
+        }
+    )
+    image = tmp_path / "manifest-background.png"
+    Image.new("RGB", (16, 9), "#24745d").save(image)
+    uploaded = service.upload_asset(filename=image.name, content=image.read_bytes())
+    registered = service.register_task_asset(
+        created["run"]["run_id"],
+        {
+            "kind": "background",
+            "upload_token": uploaded["upload_token"],
+            "expected_draft_version": created["draft"]["draft_version"],
+        },
+    )
+    task_asset_id = registered["asset"]["asset_id"]
+    assert registered["asset_manifest_upgrade_required"] is True
+    assert service.task_assets(created["run"]["run_id"])["items"][0][
+        "allowlisted"
+    ] is False
+    with pytest.raises(ProductionError) as blocked:
+        service.validate(created["run"]["run_id"])
+    assert blocked.value.code == "asset_reference_not_allowed"
+    assert blocked.value.details["task_asset_ids"] == [task_asset_id]
+
+    initial = created["asset_manifest"]
+    request = {
+        "expected_manifest_id": initial["id"],
+        "expected_content_hash": initial["content_hash"],
+        "add_task_asset_ids": [task_asset_id],
+        "remove_task_asset_ids": [],
+    }
+    upgraded = service.upgrade_asset_manifest(created["run"]["run_id"], request)
+    manifest = service.asset_manifests.payload_for_run(created["run"]["run_id"])
+
+    assert upgraded["idempotent"] is False
+    assert upgraded["previous_manifest_id"] == initial["id"]
+    assert upgraded["asset_policy"]["revision"] == 2
+    assert upgraded["asset_policy"]["asset_count"] == 1
+    assert manifest["assets"][0]["metadata"] == {
+        "task_asset_id": task_asset_id,
+        "engine_key": "manifest-background",
+    }
+    assert service.artifacts.read_bytes(manifest["assets"][0]["uri"]) == image.read_bytes()
+    assert str(configured.data_dir) not in json.dumps(manifest, ensure_ascii=False)
+    assert service.task_assets(created["run"]["run_id"])["items"][0][
+        "allowlisted"
+    ] is True
+    assert service.validate(created["run"]["run_id"])["ok"] is True
+
+    retried = service.upgrade_asset_manifest(created["run"]["run_id"], request)
+    assert retried["idempotent"] is True
+    assert retried["asset_manifest"] == upgraded["asset_manifest"]
+    history = service.asset_manifest_history(created["run"]["run_id"])
+    assert [item["asset_policy"]["revision"] for item in history["items"]] == [1, 2]
+
+    second_image = tmp_path / "manifest-second.png"
+    Image.new("RGB", (8, 8), "#335577").save(second_image)
+    second_upload = service.upload_asset(
+        filename=second_image.name, content=second_image.read_bytes()
+    )
+    second = service.register_task_asset(
+        created["run"]["run_id"],
+        {
+            "kind": "background",
+            "upload_token": second_upload["upload_token"],
+            "expected_draft_version": registered["draft"]["draft_version"],
+        },
+    )
+    with pytest.raises(ProductionError) as stale:
+        service.upgrade_asset_manifest(
+            created["run"]["run_id"],
+            {
+                **request,
+                "add_task_asset_ids": [second["asset"]["asset_id"]],
+            },
+        )
+    assert stale.value.code == "asset_manifest_revision_conflict"
+    service.jobs.close()
+
+
+def test_character_workspace_bundle_is_deterministic(tmp_path):
+    source = tmp_path / "character"
+    (source / "textures").mkdir(parents=True)
+    (source / "character.atlas").write_bytes(b"atlas")
+    (source / "textures" / "body.png").write_bytes(b"png fixture")
+
+    first = ProductionService._deterministic_bundle(source)
+    second = ProductionService._deterministic_bundle(source)
+
+    assert first == second
+    with zipfile.ZipFile(BytesIO(first)) as archive:
+        assert archive.namelist() == ["character.atlas", "textures/body.png"]
+        assert all(item.date_time == (1980, 1, 1, 0, 0, 0) for item in archive.infolist())
 
 
 def test_task_asset_registration_requires_current_draft_version(settings, tmp_path):

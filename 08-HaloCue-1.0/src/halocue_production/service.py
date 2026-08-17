@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import datetime as dt
+import io
+import mimetypes
 import re
+import uuid
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .artifacts import ArtifactStore
 from .asset_manifests import AssetManifestStore
+from .contracts import canonical_json_bytes, contract_content_hash, sha256_bytes
 from .config import Settings
 from .direction_models import CancellableModelProvider, DirectionModelGateway
 from .errors import ProductionError
@@ -19,7 +25,11 @@ from .resource_catalog import ResourceCatalog
 from .name_baseline import CharacterNameBaseline
 from .resource_previews import ResourcePreview
 from .settings_store import SettingsStore
-from .asset_staging import AssetStaging
+from .asset_staging import (
+    MAX_ARCHIVE_BYTES,
+    MAX_ARCHIVE_FILES,
+    AssetStaging,
+)
 
 
 INVALID_PROJECT = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -28,6 +38,8 @@ UPSTREAM_RELEASE_ID = re.compile(r"release-[0-9a-f]{12}")
 WORK_ID = re.compile(r"work-[0-9a-f]{12}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SCRIPT_RELEASE_SCHEMA_VERSION = "1.0"
+_TASK_ASSET_NAMESPACE = uuid.UUID("40b0223c-3395-4b1b-aeaf-96c9f030c3e7")
+_MANIFEST_SUCCESSOR_NAMESPACE = uuid.UUID("0193c639-c212-45f2-9735-317b87b74a35")
 DIRECTIVE_COMMANDS = frozenset({
     "bg", "trans", "bgfx", "popup", "bgm", "music", "se", "sound", "place", "wait",
     "enter", "exit", "move", "stage", "auto", "camera", "camera_hold", "fx", "hl",
@@ -575,17 +587,353 @@ class ProductionService:
             run.state = "waiting_for_review"
             run.updated_at = utc_now()
             self.repository.save_run(run)
-            result["run"] = self.run_detail(run_id)["run"]
-            result["draft"] = self.run_detail(run_id)["draft"]
-            result["gates"] = self.run_detail(run_id)["gates"]
+            detail = self.run_detail(run_id)
+            result["run"] = detail["run"]
+            result["draft"] = detail["draft"]
+            result["gates"] = detail["gates"]
+            result["asset_manifest"] = detail["asset_manifest"]
+            result["asset_policy"] = detail["asset_policy"]
+            result["asset_manifest_upgrade_required"] = True
         return result
 
     def task_assets(self, run_id: str) -> dict[str, Any]:
         run = self._run(run_id)
-        return {"ok": True, "run_id": run_id, "items": self.adapter.list_task_assets(str(run.draft_token))}
+        manifest = self.asset_manifests.payload_for_run(run_id)
+        allowlisted = {
+            str(asset.get("metadata", {}).get("task_asset_id") or "")
+            for asset in manifest["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        }
+        items = [
+            {**item, "allowlisted": item["asset_id"] in allowlisted}
+            for item in self.adapter.list_task_assets(str(run.draft_token))
+        ]
+        return {"ok": True, "run_id": run_id, "items": items}
+
+    @staticmethod
+    def _task_asset_ids(payload: dict[str, Any], field: str) -> list[str]:
+        value = payload.get(field, [])
+        if not isinstance(value, list) or len(value) > 100:
+            raise ProductionError(
+                "asset_manifest_change_invalid",
+                f"{field} 必须是不超过 100 项的数组",
+            )
+        values = [str(item or "").strip() for item in value]
+        if any(not re.fullmatch(r"asset-[0-9a-f]{12}", item) for item in values):
+            raise ProductionError(
+                "asset_manifest_change_invalid", f"{field} 包含无效素材 ID"
+            )
+        if len(values) != len(set(values)):
+            raise ProductionError(
+                "asset_manifest_change_invalid", f"{field} 不得包含重复素材 ID"
+            )
+        return values
+
+    @staticmethod
+    def _deterministic_bundle(source: Path) -> bytes:
+        files: list[tuple[str, Path]] = []
+        total = 0
+        for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_symlink():
+                raise ProductionError(
+                    "task_asset_corrupt", "角色素材包含不安全的符号链接", status=500
+                )
+            if not path.is_file():
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(source.resolve())
+                size = resolved.stat().st_size
+            except (OSError, ValueError) as exc:
+                raise ProductionError(
+                    "task_asset_corrupt", "角色素材内容无法安全读取", status=500
+                ) from exc
+            total += size
+            files.append((path.relative_to(source).as_posix(), resolved))
+        if (
+            not files
+            or len(files) > MAX_ARCHIVE_FILES
+            or total > MAX_ARCHIVE_BYTES
+        ):
+            raise ProductionError(
+                "task_asset_corrupt", "角色素材包内容为空或超出安全限制", status=500
+            )
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+            for relative, path in files:
+                info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_STORED
+                info.create_system = 3
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, path.read_bytes())
+        return output.getvalue()
+
+    @staticmethod
+    def _duplicate_workspace_file(error: ProductionError, artifacts: ArtifactStore):
+        if error.code != "workspace_file_duplicate":
+            raise error
+        existing_uri = str(error.details.get("existing_uri") or "")
+        if not existing_uri:
+            raise error
+        return artifacts.get(existing_uri)
+
+    def _freeze_task_asset(
+        self, run: ProductionRun, task_asset_id: str
+    ) -> dict[str, Any]:
+        if not run.production_run_id:
+            raise ProductionError(
+                "production_run_identity_invalid", "制作任务缺少稳定身份", status=500
+            )
+        record, source = self.adapter.task_asset_record(
+            str(run.draft_token), task_asset_id
+        )
+        asset_id = str(
+            uuid.uuid5(
+                _TASK_ASSET_NAMESPACE,
+                f"{run.production_run_id}:{task_asset_id}",
+            )
+        )
+        kind = str(record.get("kind") or "")
+        contract_kind = {
+            "background": "background",
+            "cg": "popup",
+            "sound": "sound",
+            "character": "character",
+        }.get(kind)
+        if contract_kind is None:
+            raise ProductionError(
+                "invalid_asset_kind", "任务素材类型无法写入 AssetManifest"
+            )
+        metadata = {
+            "task_asset_id": task_asset_id,
+            "engine_key": str(record.get("key") or ""),
+        }
+        if kind == "character":
+            uri = f"workspace://assets/items/{asset_id}/bundle.zip"
+            try:
+                artifact = self.artifacts.commit_bytes(
+                    uri,
+                    self._deterministic_bundle(source),
+                    kind=contract_kind,
+                    media_type="application/zip",
+                    metadata=metadata,
+                )
+            except ProductionError as exc:
+                artifact = self._duplicate_workspace_file(exc, self.artifacts)
+        else:
+            suffix = source.suffix.casefold()
+            uri = f"workspace://assets/items/{asset_id}/content{suffix}"
+            media_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+            try:
+                artifact = self.artifacts.commit_file(
+                    uri,
+                    source,
+                    kind=contract_kind,
+                    media_type=media_type,
+                    metadata=metadata,
+                )
+            except ProductionError as exc:
+                artifact = self._duplicate_workspace_file(exc, self.artifacts)
+        return {
+            "asset_id": asset_id,
+            "kind": contract_kind,
+            "uri": artifact.uri,
+            "content_hash": artifact.content_hash,
+            "display_name": str(record.get("display_name") or record.get("key") or task_asset_id),
+            "media_type": artifact.media_type,
+            "metadata": metadata,
+        }
+
+    @staticmethod
+    def _successor_manifest(
+        run: ProductionRun,
+        current: dict[str, Any],
+        assets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        ordered = sorted(assets, key=lambda item: item["asset_id"])
+        digest = sha256_bytes(canonical_json_bytes(ordered))
+        manifest_id = str(
+            uuid.uuid5(
+                _MANIFEST_SUCCESSOR_NAMESPACE,
+                f'{run.production_run_id}:{current["id"]}:{digest}',
+            )
+        )
+        created_at = dt.datetime.fromisoformat(
+            str(current["created_at"]).replace("Z", "+00:00")
+        ) + dt.timedelta(microseconds=1)
+        payload: dict[str, Any] = {
+            "schema_version": "1.0",
+            "id": manifest_id,
+            "content_hash": "",
+            "created_at": created_at.isoformat(),
+            "assets": ordered,
+        }
+        payload["content_hash"] = contract_content_hash("AssetManifest", payload)
+        return payload
+
+    def upgrade_asset_manifest(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        unexpected = sorted(
+            set(payload)
+            - {
+                "expected_manifest_id",
+                "expected_content_hash",
+                "add_task_asset_ids",
+                "remove_task_asset_ids",
+            }
+        )
+        if unexpected:
+            raise ProductionError(
+                "asset_manifest_change_invalid",
+                "素材清单升级请求包含未知字段",
+                details={"fields": unexpected},
+            )
+        expected_id = str(payload.get("expected_manifest_id") or "").strip()
+        expected_hash = str(payload.get("expected_content_hash") or "").strip()
+        try:
+            if str(uuid.UUID(expected_id)) != expected_id:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ProductionError(
+                "asset_manifest_reference_invalid", "expected_manifest_id 必须是规范 UUID"
+            ) from exc
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_hash):
+            raise ProductionError(
+                "asset_manifest_reference_invalid",
+                "expected_content_hash 必须是规范 SHA-256",
+            )
+        additions = self._task_asset_ids(payload, "add_task_asset_ids")
+        removals = self._task_asset_ids(payload, "remove_task_asset_ids")
+        if not additions and not removals:
+            raise ProductionError(
+                "asset_manifest_change_empty", "素材清单升级必须包含添加或移除项"
+            )
+        overlap = sorted(set(additions) & set(removals))
+        if overlap:
+            raise ProductionError(
+                "asset_manifest_change_invalid",
+                "同一素材不能同时添加和移除",
+                details={"asset_ids": overlap},
+            )
+        run = self._run(run_id)
+        current_description = self.asset_manifests.describe_for_run(run_id)
+        current = self.asset_manifests.payload_for_run(run_id)
+        by_task_id = {
+            str(asset.get("metadata", {}).get("task_asset_id") or ""): asset
+            for asset in current["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        }
+        already_applied = all(item in by_task_id for item in additions) and all(
+            item not in by_task_id for item in removals
+        )
+        if current["id"] != expected_id or current["content_hash"] != expected_hash:
+            if already_applied:
+                return {
+                    "ok": True,
+                    "run_id": run_id,
+                    "asset_manifest": current_description["reference"],
+                    "asset_policy": current_description["policy"],
+                    "idempotent": True,
+                    "added_task_asset_ids": additions,
+                    "removed_task_asset_ids": removals,
+                }
+            raise ProductionError(
+                "asset_manifest_revision_conflict",
+                "AssetManifest 已被其他操作升级",
+                status=409,
+                details={
+                    "run_id": run_id,
+                    "current_manifest_id": current["id"],
+                    "current_content_hash": current["content_hash"],
+                },
+            )
+        next_assets = [
+            asset
+            for asset in current["assets"]
+            if str(asset.get("metadata", {}).get("task_asset_id") or "")
+            not in removals
+        ]
+        existing_ids = {asset["metadata"].get("task_asset_id") for asset in next_assets}
+        for task_asset_id in additions:
+            if task_asset_id not in existing_ids:
+                next_assets.append(self._freeze_task_asset(run, task_asset_id))
+        if next_assets == current["assets"]:
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "asset_manifest": current_description["reference"],
+                "asset_policy": current_description["policy"],
+                "idempotent": True,
+                "added_task_asset_ids": additions,
+                "removed_task_asset_ids": removals,
+            }
+        successor = self._successor_manifest(run, current, next_assets)
+        description = self.asset_manifests.advance(
+            run,
+            successor,
+            expected_manifest_id=expected_id,
+            expected_content_hash=expected_hash,
+            source_kind="task_asset_upgrade",
+            selection_kind="user_asset_upgrade",
+        )
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "asset_manifest": description["reference"],
+            "asset_policy": description["policy"],
+            "idempotent": False,
+            "previous_manifest_id": current["id"],
+            "added_task_asset_ids": additions,
+            "removed_task_asset_ids": removals,
+        }
+
+    def asset_manifest_history(self, run_id: str) -> dict[str, Any]:
+        self._run(run_id)
+        history = self.asset_manifests.history_for_run(run_id)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "items": [
+                {
+                    "asset_manifest": item["reference"],
+                    "asset_policy": item["policy"],
+                    "predecessor_manifest_id": item["predecessor_manifest_id"],
+                    "selection_kind": item["selection_kind"],
+                    "selected_at": item["selected_at"],
+                }
+                for item in history
+            ],
+        }
+
+    def _require_task_assets_allowlisted(self, run: ProductionRun) -> None:
+        manifest = self.asset_manifests.payload_for_run(run.run_id)
+        allowed = {
+            str(asset.get("metadata", {}).get("task_asset_id") or "")
+            for asset in manifest["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        }
+        missing = sorted(
+            item["asset_id"]
+            for item in self.adapter.list_task_assets(str(run.draft_token))
+            if item["asset_id"] not in allowed
+        )
+        if missing:
+            raise ProductionError(
+                "asset_reference_not_allowed",
+                "自定义素材尚未进入当前任务的冻结白名单",
+                status=409,
+                details={"run_id": run.run_id, "task_asset_ids": missing},
+            )
 
     def remove_task_asset(self, run_id: str, asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         run = self._run(run_id)
+        current_manifest = self.asset_manifests.payload_for_run(run_id)
+        was_allowlisted = any(
+            asset.get("metadata", {}).get("task_asset_id") == asset_id
+            for asset in current_manifest["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        )
         self.adapter.remove_task_asset(
             token=str(run.draft_token), asset_id=asset_id,
             expected_draft_version=self._expected_version(payload),
@@ -593,7 +941,10 @@ class ProductionService:
         run.state = "waiting_for_review"
         run.updated_at = utc_now()
         self.repository.save_run(run)
-        return self.run_detail(run_id)
+        result = self.run_detail(run_id)
+        result["asset_manifest_upgrade_required"] = was_allowlisted
+        result["removed_task_asset_id"] = asset_id
+        return result
 
     def run_resource_preview(self, run_id: str, kind: str, key: str) -> ResourcePreview:
         run = self._run(run_id)
@@ -1346,6 +1697,7 @@ class ProductionService:
 
     def validate(self, run_id: str) -> dict[str, Any]:
         run = self._run(run_id)
+        self._require_task_assets_allowlisted(run)
         return self.adapter.validate(str(run.draft_token))
 
     def compile(
@@ -1356,6 +1708,7 @@ class ProductionService:
         work_item_id: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         run = self._run(run_id)
+        self._require_task_assets_allowlisted(run)
         try:
             expected = int(payload["expected_draft_version"])
         except (KeyError, TypeError, ValueError) as exc:

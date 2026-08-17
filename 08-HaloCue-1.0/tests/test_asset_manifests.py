@@ -118,6 +118,87 @@ def test_same_run_rejects_a_different_frozen_manifest(tmp_path):
     assert raised.value.status == 409
 
 
+def test_manifest_successor_preserves_history_and_rejects_stale_head(tmp_path):
+    repository = ProductionRepository(tmp_path)
+    run = saved_run(repository)
+    artifacts = ArtifactStore(tmp_path / "workspace", repository.runtime)
+    manifests = AssetManifestStore(artifacts, repository.runtime)
+    first_asset = artifacts.commit_bytes(
+        "workspace://assets/backgrounds/first.png",
+        b"first fixture",
+        kind="background",
+        media_type="image/png",
+    )
+    first_payload = manifest_payload(
+        {
+            "asset_id": str(uuid.uuid4()),
+            "kind": "background",
+            "uri": first_asset.uri,
+            "content_hash": first_asset.content_hash,
+            "display_name": "First",
+            "media_type": "image/png",
+            "metadata": {},
+        }
+    )
+    first = manifests.freeze(run, first_payload, source_kind="production_request")
+    first_bytes = artifacts.read_bytes(first["reference"]["uri"])
+    second_asset = artifacts.commit_bytes(
+        "workspace://assets/backgrounds/second.png",
+        b"second fixture",
+        kind="background",
+        media_type="image/png",
+    )
+    successor = {
+        "schema_version": "1.0",
+        "id": str(uuid.uuid4()),
+        "content_hash": "",
+        "created_at": "2026-08-15T04:05:01+00:00",
+        "assets": [
+            *first_payload["assets"],
+            {
+                "asset_id": str(uuid.uuid4()),
+                "kind": "background",
+                "uri": second_asset.uri,
+                "content_hash": second_asset.content_hash,
+                "display_name": "Second",
+                "media_type": "image/png",
+                "metadata": {},
+            },
+        ],
+    }
+    successor["content_hash"] = contract_content_hash("AssetManifest", successor)
+
+    second = manifests.advance(
+        run,
+        successor,
+        expected_manifest_id=first["reference"]["id"],
+        expected_content_hash=first["reference"]["content_hash"],
+        source_kind="task_asset_upgrade",
+        selection_kind="user_asset_upgrade",
+    )
+
+    assert second["policy"]["revision"] == 2
+    assert second["policy"]["asset_count"] == 2
+    assert artifacts.read_bytes(first["reference"]["uri"]) == first_bytes
+    history = manifests.history_for_run(run.run_id)
+    assert [item["policy"]["revision"] for item in history] == [1, 2]
+    assert history[1]["predecessor_manifest_id"] == first["reference"]["id"]
+
+    stale = dict(successor)
+    stale["id"] = str(uuid.uuid4())
+    stale["content_hash"] = contract_content_hash("AssetManifest", stale)
+    with pytest.raises(ProductionError) as raised:
+        manifests.advance(
+            run,
+            stale,
+            expected_manifest_id=first["reference"]["id"],
+            expected_content_hash=first["reference"]["content_hash"],
+            source_kind="task_asset_upgrade",
+            selection_kind="user_asset_upgrade",
+        )
+    assert raised.value.code == "asset_manifest_revision_conflict"
+
+
 def test_manifest_rejects_unregistered_or_hash_mismatched_assets(tmp_path):
     repository = ProductionRepository(tmp_path)
     run = saved_run(repository)
@@ -185,6 +266,7 @@ def test_compatibility_run_freezes_empty_manifest_without_aa_resource_data(
         "mode": "whitelist_only",
         "source": "compatibility_empty",
         "asset_count": 0,
+        "revision": 1,
     }
     assert reference["content_hash"] == manifest["content_hash"]
     assert binding["file_hash"] == service.artifacts.get(reference["uri"]).content_hash

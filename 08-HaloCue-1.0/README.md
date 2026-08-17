@@ -154,6 +154,8 @@ The selected path is persisted only in `08-HaloCue-1.0/data/settings.json`.
 GET  /api/v1/production-runs
 POST /api/v1/production-runs
 GET  /api/v1/production-runs/{run_id}
+GET  /api/v1/production-runs/{run_id}/asset-manifests
+POST /api/v1/production-runs/{run_id}/asset-manifests
 POST /api/v1/production-runs/{run_id}/cast-bindings
 POST /api/v1/production-runs/{run_id}/review/approve
 POST /api/v1/production-runs/{run_id}/validate
@@ -161,6 +163,26 @@ POST /api/v1/production-runs/{run_id}/compile
 POST /api/v1/production-runs/{run_id}/install
 GET  /api/v1/jobs/{job_id}
 ```
+
+Every run has an immutable `AssetManifest/1.0`. Registering a task-local custom
+asset does not silently mutate that manifest. The explicit manifest upgrade
+request is:
+
+```json
+{
+  "expected_manifest_id": "canonical UUID",
+  "expected_content_hash": "sha256:...",
+  "add_task_asset_ids": ["asset-000000000001"],
+  "remove_task_asset_ids": []
+}
+```
+
+The request creates a successor manifest and preserves the prior manifest in
+the run history. Repeating an already-applied request is idempotent. A stale
+head returns `409 asset_manifest_revision_conflict`. Validation and compilation
+return `409 asset_reference_not_allowed` while any registered custom asset is
+outside the current frozen manifest. Responses expose only canonical IDs,
+display metadata, hashes, and `workspace://` URIs.
 
 ### Review cards
 

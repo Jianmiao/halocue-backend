@@ -66,6 +66,8 @@ def test_runtime_store_creates_current_schema(tmp_path):
         "production_events",
         "workspace_files",
         "asset_manifests",
+        "production_run_asset_manifest_history",
+        "production_run_asset_manifest_heads",
     } <= tables
 
 
@@ -87,7 +89,7 @@ def test_runtime_store_upgrades_v1_to_current(tmp_path):
     assert {"uri", "relative_path", "content_hash", "size_bytes"} <= workspace_columns
 
 
-def test_runtime_store_upgrades_v3_to_v4_without_losing_runs(tmp_path):
+def test_runtime_store_upgrades_v3_to_current_without_losing_runs(tmp_path):
     path = tmp_path / "runtime.sqlite3"
     legacy = RuntimeStore(path, target_version=3)
     production_run_id, _ = legacy.save_production_run(legacy_run_payload())
@@ -104,13 +106,56 @@ def test_runtime_store_upgrades_v3_to_v4_without_losing_runs(tmp_path):
         }
     assert {
         "id",
-        "run_id",
         "workspace_uri",
         "content_hash",
         "file_hash",
         "source_kind",
         "created_at",
     } <= columns
+
+
+def test_runtime_store_upgrades_v4_manifest_binding_to_versioned_history(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=4)
+    production_run_id, _ = legacy.save_production_run(legacy_run_payload())
+    uri = "workspace://assets/77777777-7777-4777-8777-777777777777/manifest.json"
+    file_hash = "sha256:" + "a" * 64
+    legacy.register_workspace_file(
+        uri=uri,
+        relative_path="assets/77777777-7777-4777-8777-777777777777/manifest.json",
+        kind="asset-manifest",
+        content_hash=file_hash,
+        size_bytes=10,
+        media_type="application/json",
+        metadata={},
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO asset_manifests(
+              id, run_id, workspace_uri, content_hash, file_hash,
+              source_kind, created_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                "77777777-7777-4777-8777-777777777777",
+                production_run_id,
+                uri,
+                "sha256:" + "b" * 64,
+                file_hash,
+                "compatibility_empty",
+                "2026-08-15T04:05:00+00:00",
+            ),
+        )
+
+    upgraded = RuntimeStore(path)
+    current = upgraded.get_asset_manifest_for_run("run-000000000001")
+    history = upgraded.list_asset_manifests_for_run("run-000000000001")
+
+    assert current["id"] == "77777777-7777-4777-8777-777777777777"
+    assert current["revision"] == 1
+    assert current["production_run_id"] == production_run_id
+    assert history == [current]
 
 
 def test_runtime_store_rejects_newer_schema_version(tmp_path):

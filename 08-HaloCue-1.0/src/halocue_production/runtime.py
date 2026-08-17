@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 4
+RUNTIME_SCHEMA_VERSION = 5
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -155,6 +155,69 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
           FOREIGN KEY(workspace_uri) REFERENCES workspace_files(uri)
         )
         """,
+    ),
+    5: (
+        "ALTER TABLE asset_manifests RENAME TO asset_manifests_v4",
+        """
+        CREATE TABLE asset_manifests (
+          id TEXT PRIMARY KEY,
+          workspace_uri TEXT NOT NULL UNIQUE,
+          content_hash TEXT NOT NULL,
+          file_hash TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(workspace_uri) REFERENCES workspace_files(uri)
+        )
+        """,
+        """
+        INSERT INTO asset_manifests(
+          id, workspace_uri, content_hash, file_hash, source_kind, created_at
+        )
+        SELECT id, workspace_uri, content_hash, file_hash, source_kind, created_at
+        FROM asset_manifests_v4
+        """,
+        """
+        CREATE TABLE production_run_asset_manifest_history (
+          run_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          manifest_id TEXT NOT NULL,
+          predecessor_manifest_id TEXT,
+          selection_kind TEXT NOT NULL,
+          selected_at TEXT NOT NULL,
+          PRIMARY KEY(run_id, ordinal),
+          UNIQUE(run_id, manifest_id),
+          FOREIGN KEY(run_id) REFERENCES production_runs(id),
+          FOREIGN KEY(manifest_id) REFERENCES asset_manifests(id),
+          FOREIGN KEY(predecessor_manifest_id) REFERENCES asset_manifests(id)
+        )
+        """,
+        """
+        INSERT INTO production_run_asset_manifest_history(
+          run_id, ordinal, manifest_id, predecessor_manifest_id,
+          selection_kind, selected_at
+        )
+        SELECT run_id, 1, id, NULL, 'initial', created_at
+        FROM asset_manifests_v4
+        """,
+        """
+        CREATE TABLE production_run_asset_manifest_heads (
+          run_id TEXT PRIMARY KEY,
+          manifest_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES production_runs(id),
+          FOREIGN KEY(manifest_id) REFERENCES asset_manifests(id)
+        )
+        """,
+        """
+        INSERT INTO production_run_asset_manifest_heads(
+          run_id, manifest_id, ordinal, updated_at
+        )
+        SELECT run_id, id, 1, created_at
+        FROM asset_manifests_v4
+        """,
+        "CREATE INDEX idx_asset_manifest_history_manifest ON production_run_asset_manifest_history(manifest_id)",
+        "DROP TABLE asset_manifests_v4",
     ),
 }
 
@@ -458,19 +521,115 @@ class RuntimeStore:
             return self._workspace_file_payload(row)
 
     @staticmethod
-    def _asset_manifest_payload(
-        row: sqlite3.Row, *, legacy_run_id: str
-    ) -> dict[str, Any]:
+    def _asset_manifest_payload(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
-            "run_id": legacy_run_id,
-            "production_run_id": str(row["run_id"]),
+            "run_id": str(row["legacy_run_id"]),
+            "production_run_id": str(row["production_run_id"]),
             "workspace_uri": str(row["workspace_uri"]),
             "content_hash": str(row["content_hash"]),
             "file_hash": str(row["file_hash"]),
             "source_kind": str(row["source_kind"]),
             "created_at": str(row["created_at"]),
+            "revision": int(row["ordinal"]),
+            "predecessor_manifest_id": row["predecessor_manifest_id"],
+            "selection_kind": str(row["selection_kind"]),
+            "selected_at": str(row["selected_at"]),
         }
+
+    @staticmethod
+    def _current_asset_manifest_row(
+        connection: sqlite3.Connection, production_run_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT manifests.*, runs.id AS production_run_id,
+                   runs.legacy_run_id, heads.ordinal,
+                   history.predecessor_manifest_id,
+                   history.selection_kind, history.selected_at
+            FROM production_run_asset_manifest_heads AS heads
+            JOIN production_runs AS runs ON runs.id=heads.run_id
+            JOIN asset_manifests AS manifests ON manifests.id=heads.manifest_id
+            JOIN production_run_asset_manifest_history AS history
+              ON history.run_id=heads.run_id AND history.ordinal=heads.ordinal
+            WHERE heads.run_id=?
+            """,
+            (production_run_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _register_asset_manifest(
+        connection: sqlite3.Connection,
+        *,
+        manifest_id: str,
+        workspace_uri: str,
+        content_hash: str,
+        file_hash: str,
+        source_kind: str,
+        created_at: str,
+    ) -> None:
+        workspace_file = connection.execute(
+            "SELECT content_hash FROM workspace_files WHERE uri=?",
+            (workspace_uri,),
+        ).fetchone()
+        if workspace_file is None:
+            raise ProductionError(
+                "workspace_file_not_found",
+                "AssetManifest 工作区文件尚未登记",
+                status=404,
+                details={"uri": workspace_uri},
+            )
+        if str(workspace_file["content_hash"]) != file_hash:
+            raise ProductionError(
+                "asset_manifest_file_hash_mismatch",
+                "AssetManifest 文件哈希与工作区登记不一致",
+                status=409,
+                details={"uri": workspace_uri},
+            )
+        values = {
+            "workspace_uri": workspace_uri,
+            "content_hash": content_hash,
+            "file_hash": file_hash,
+            "source_kind": source_kind,
+            "created_at": created_at,
+        }
+        existing = connection.execute(
+            "SELECT * FROM asset_manifests WHERE id=?", (manifest_id,)
+        ).fetchone()
+        if existing is not None:
+            if any(str(existing[key]) != str(value) for key, value in values.items()):
+                raise ProductionError(
+                    "asset_manifest_identity_conflict",
+                    "同一 AssetManifest ID 已登记不同内容",
+                    status=409,
+                    details={"manifest_id": manifest_id},
+                )
+            return
+        uri_owner = connection.execute(
+            "SELECT id FROM asset_manifests WHERE workspace_uri=?", (workspace_uri,)
+        ).fetchone()
+        if uri_owner is not None:
+            raise ProductionError(
+                "asset_manifest_identity_conflict",
+                "AssetManifest 工作区 URI 已属于其他清单",
+                status=409,
+                details={"manifest_id": manifest_id, "uri": workspace_uri},
+            )
+        connection.execute(
+            """
+            INSERT INTO asset_manifests(
+              id, workspace_uri, content_hash, file_hash, source_kind, created_at
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                manifest_id,
+                workspace_uri,
+                content_hash,
+                file_hash,
+                source_kind,
+                created_at,
+            ),
+        )
 
     def bind_asset_manifest(
         self,
@@ -491,81 +650,175 @@ class RuntimeStore:
             if run is None:
                 raise ProductionError("run_not_found", "制作任务不存在", status=404)
             production_run_id = str(run["id"])
-            workspace_file = connection.execute(
-                "SELECT content_hash FROM workspace_files WHERE uri=?",
-                (workspace_uri,),
-            ).fetchone()
-            if workspace_file is None:
-                raise ProductionError(
-                    "workspace_file_not_found",
-                    "AssetManifest 工作区文件尚未登记",
-                    status=404,
-                    details={"uri": workspace_uri},
-                )
-            if str(workspace_file["content_hash"]) != file_hash:
-                raise ProductionError(
-                    "asset_manifest_file_hash_mismatch",
-                    "AssetManifest 文件哈希与工作区登记不一致",
-                    status=409,
-                    details={"uri": workspace_uri},
-                )
-            values = {
-                "id": manifest_id,
-                "run_id": production_run_id,
-                "workspace_uri": workspace_uri,
-                "content_hash": content_hash,
-                "file_hash": file_hash,
-                "source_kind": source_kind,
-                "created_at": created_at,
-            }
-            existing = connection.execute(
-                "SELECT * FROM asset_manifests WHERE run_id=?",
-                (production_run_id,),
-            ).fetchone()
-            if existing is not None:
-                if any(str(existing[key]) != str(value) for key, value in values.items()):
+            current = self._current_asset_manifest_row(connection, production_run_id)
+            if current is not None:
+                if str(current["id"]) != manifest_id:
                     raise ProductionError(
                         "asset_manifest_conflict",
                         "同一制作任务已冻结不同的 AssetManifest",
                         status=409,
                         details={
                             "run_id": legacy_run_id,
-                            "existing_manifest_id": str(existing["id"]),
+                            "existing_manifest_id": str(current["id"]),
                         },
                     )
-                return self._asset_manifest_payload(
-                    existing, legacy_run_id=legacy_run_id
+                self._register_asset_manifest(
+                    connection,
+                    manifest_id=manifest_id,
+                    workspace_uri=workspace_uri,
+                    content_hash=content_hash,
+                    file_hash=file_hash,
+                    source_kind=source_kind,
+                    created_at=created_at,
                 )
+                return self._asset_manifest_payload(current)
             try:
+                self._register_asset_manifest(
+                    connection,
+                    manifest_id=manifest_id,
+                    workspace_uri=workspace_uri,
+                    content_hash=content_hash,
+                    file_hash=file_hash,
+                    source_kind=source_kind,
+                    created_at=created_at,
+                )
                 connection.execute(
                     """
-                    INSERT INTO asset_manifests(
-                      id, run_id, workspace_uri, content_hash, file_hash,
-                      source_kind, created_at
-                    ) VALUES(?,?,?,?,?,?,?)
+                    INSERT INTO production_run_asset_manifest_history(
+                      run_id, ordinal, manifest_id, predecessor_manifest_id,
+                      selection_kind, selected_at
+                    ) VALUES(?,1,?,NULL,'initial',?)
                     """,
-                    (
-                        manifest_id,
-                        production_run_id,
-                        workspace_uri,
-                        content_hash,
-                        file_hash,
-                        source_kind,
-                        created_at,
-                    ),
+                    (production_run_id, manifest_id, created_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO production_run_asset_manifest_heads(
+                      run_id, manifest_id, ordinal, updated_at
+                    ) VALUES(?,?,1,?)
+                    """,
+                    (production_run_id, manifest_id, created_at),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ProductionError(
                     "asset_manifest_conflict",
-                    "AssetManifest 身份或工作区 URI 已绑定其他制作任务",
+                    "AssetManifest 初始绑定与已有记录冲突",
                     status=409,
                     details={"run_id": legacy_run_id, "manifest_id": manifest_id},
                 ) from exc
-            row = connection.execute(
-                "SELECT * FROM asset_manifests WHERE run_id=?",
-                (production_run_id,),
+            row = self._current_asset_manifest_row(connection, production_run_id)
+            return self._asset_manifest_payload(row)
+
+    def advance_asset_manifest(
+        self,
+        *,
+        legacy_run_id: str,
+        expected_manifest_id: str,
+        expected_content_hash: str,
+        manifest_id: str,
+        workspace_uri: str,
+        content_hash: str,
+        file_hash: str,
+        source_kind: str,
+        created_at: str,
+        selection_kind: str,
+    ) -> dict[str, Any]:
+        selected_at = _now()
+        with self._transaction() as connection:
+            run = connection.execute(
+                "SELECT id FROM production_runs WHERE legacy_run_id=?",
+                (legacy_run_id,),
             ).fetchone()
-            return self._asset_manifest_payload(row, legacy_run_id=legacy_run_id)
+            if run is None:
+                raise ProductionError("run_not_found", "制作任务不存在", status=404)
+            production_run_id = str(run["id"])
+            current = self._current_asset_manifest_row(connection, production_run_id)
+            if current is None:
+                raise ProductionError(
+                    "asset_manifest_not_found",
+                    "制作任务尚未冻结 AssetManifest",
+                    status=409,
+                    details={"run_id": legacy_run_id},
+                )
+            if (
+                str(current["id"]) != expected_manifest_id
+                or str(current["content_hash"]) != expected_content_hash
+            ):
+                if (
+                    str(current["id"]) == manifest_id
+                    and str(current["content_hash"]) == content_hash
+                ):
+                    return self._asset_manifest_payload(current)
+                raise ProductionError(
+                    "asset_manifest_revision_conflict",
+                    "AssetManifest 已被其他操作升级",
+                    status=409,
+                    details={
+                        "run_id": legacy_run_id,
+                        "current_manifest_id": str(current["id"]),
+                        "current_content_hash": str(current["content_hash"]),
+                    },
+                )
+            self._register_asset_manifest(
+                connection,
+                manifest_id=manifest_id,
+                workspace_uri=workspace_uri,
+                content_hash=content_hash,
+                file_hash=file_hash,
+                source_kind=source_kind,
+                created_at=created_at,
+            )
+            if manifest_id == str(current["id"]):
+                return self._asset_manifest_payload(current)
+            ordinal = int(current["ordinal"]) + 1
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO production_run_asset_manifest_history(
+                      run_id, ordinal, manifest_id, predecessor_manifest_id,
+                      selection_kind, selected_at
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        production_run_id,
+                        ordinal,
+                        manifest_id,
+                        str(current["id"]),
+                        selection_kind,
+                        selected_at,
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE production_run_asset_manifest_heads
+                    SET manifest_id=?, ordinal=?, updated_at=?
+                    WHERE run_id=? AND manifest_id=? AND ordinal=?
+                    """,
+                    (
+                        manifest_id,
+                        ordinal,
+                        selected_at,
+                        production_run_id,
+                        expected_manifest_id,
+                        int(current["ordinal"]),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ProductionError(
+                        "asset_manifest_revision_conflict",
+                        "AssetManifest 已被其他操作升级",
+                        status=409,
+                        details={"run_id": legacy_run_id},
+                    )
+            except sqlite3.IntegrityError as exc:
+                raise ProductionError(
+                    "asset_manifest_revision_conflict",
+                    "AssetManifest 后继版本与已有历史冲突",
+                    status=409,
+                    details={"run_id": legacy_run_id, "manifest_id": manifest_id},
+                ) from exc
+            row = self._current_asset_manifest_row(connection, production_run_id)
+            return self._asset_manifest_payload(row)
 
     def get_asset_manifest_for_run(
         self, legacy_run_id: str
@@ -574,18 +827,45 @@ class RuntimeStore:
         try:
             row = connection.execute(
                 """
-                SELECT manifests.*
-                FROM asset_manifests AS manifests
-                JOIN production_runs AS runs ON runs.id=manifests.run_id
+                SELECT manifests.*, runs.id AS production_run_id,
+                       runs.legacy_run_id, heads.ordinal,
+                       history.predecessor_manifest_id,
+                       history.selection_kind, history.selected_at
+                FROM production_run_asset_manifest_heads AS heads
+                JOIN production_runs AS runs ON runs.id=heads.run_id
+                JOIN asset_manifests AS manifests ON manifests.id=heads.manifest_id
+                JOIN production_run_asset_manifest_history AS history
+                  ON history.run_id=heads.run_id AND history.ordinal=heads.ordinal
                 WHERE runs.legacy_run_id=?
                 """,
                 (legacy_run_id,),
             ).fetchone()
-            return (
-                self._asset_manifest_payload(row, legacy_run_id=legacy_run_id)
-                if row
-                else None
-            )
+            return self._asset_manifest_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def list_asset_manifests_for_run(
+        self, legacy_run_id: str
+    ) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT manifests.*, runs.id AS production_run_id,
+                       runs.legacy_run_id, history.ordinal,
+                       history.predecessor_manifest_id,
+                       history.selection_kind, history.selected_at
+                FROM production_run_asset_manifest_history AS history
+                JOIN production_runs AS runs ON runs.id=history.run_id
+                JOIN asset_manifests AS manifests ON manifests.id=history.manifest_id
+                WHERE runs.legacy_run_id=?
+                ORDER BY history.ordinal
+                """,
+                (legacy_run_id,),
+            ).fetchall()
+            return [self._asset_manifest_payload(row) for row in rows]
         except sqlite3.DatabaseError as exc:
             raise self._database_error(exc) from exc
         finally:

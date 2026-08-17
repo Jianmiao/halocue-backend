@@ -32,6 +32,7 @@ CG_SEGMENT_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/cg-segments/([^
 RUN_RESOURCE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/resources/(characters|backgrounds|cg-backgrounds|sounds|cg)$")
 RUN_CHARACTER_RESOURCE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/resources/characters/([^/]+)$")
 RUN_RESOURCE_USAGE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/resource-usage$")
+RUN_ASSET_MANIFESTS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/asset-manifests$")
 RUN_ASSETS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/assets$")
 RUN_ASSET_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/assets/(asset-[0-9a-f]{12})$")
 RUN_ASSET_VALIDATE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/assets/validate$")
@@ -232,6 +233,14 @@ class ProductionHandler(BaseHTTPRequestHandler):
         match = RUN_RESOURCE_USAGE_ROUTE.fullmatch(path)
         if match and method == "GET":
             return 200, self.service.resource_usage(match.group(1))
+        match = RUN_ASSET_MANIFESTS_ROUTE.fullmatch(path)
+        if match:
+            if method == "GET":
+                return 200, self.service.asset_manifest_history(match.group(1))
+            if method == "POST":
+                return 201, self.service.upgrade_asset_manifest(
+                    match.group(1), self._body()
+                )
         match = RUN_ASSETS_ROUTE.fullmatch(path)
         if match:
             if method == "GET":
