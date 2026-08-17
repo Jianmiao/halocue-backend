@@ -65,6 +65,7 @@ def test_runtime_store_creates_current_schema(tmp_path):
         "job_attempts",
         "production_events",
         "workspace_files",
+        "asset_manifests",
     } <= tables
 
 
@@ -84,6 +85,32 @@ def test_runtime_store_upgrades_v1_to_current(tmp_path):
         }
     assert "cancellation_requested" in attempt_columns
     assert {"uri", "relative_path", "content_hash", "size_bytes"} <= workspace_columns
+
+
+def test_runtime_store_upgrades_v3_to_v4_without_losing_runs(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=3)
+    production_run_id, _ = legacy.save_production_run(legacy_run_payload())
+
+    upgraded = RuntimeStore(path)
+
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert upgraded.get_production_run("run-000000000001")[
+        "production_run_id"
+    ] == production_run_id
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(asset_manifests)")
+        }
+    assert {
+        "id",
+        "run_id",
+        "workspace_uri",
+        "content_hash",
+        "file_hash",
+        "source_kind",
+        "created_at",
+    } <= columns
 
 
 def test_runtime_store_rejects_newer_schema_version(tmp_path):

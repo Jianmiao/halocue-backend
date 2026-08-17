@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import ArtifactStore
+from .asset_manifests import AssetManifestStore
 from .config import Settings
 from .direction_models import CancellableModelProvider, DirectionModelGateway
 from .errors import ProductionError
@@ -44,6 +45,11 @@ class ProductionService:
         self.artifacts = ArtifactStore(
             settings.data_dir / "workspace", self.repository.runtime
         )
+        self.asset_manifests = AssetManifestStore(
+            self.artifacts, self.repository.runtime
+        )
+        for existing_run in self.repository.list_runs():
+            self.asset_manifests.ensure_compatibility_manifest(existing_run)
         self.settings_store = SettingsStore(settings.data_dir)
         persisted = self.settings_store.load()
         if settings.aa_data is None and persisted.get("aa_data"):
@@ -693,6 +699,7 @@ class ProductionService:
         )
         run.source_summary["generation_mode"] = generation_mode
         self.repository.save_run(run)
+        self.asset_manifests.ensure_compatibility_manifest(run)
         result = self.run_detail(run.run_id)
         if upstream_release:
             result["handoff"] = {
@@ -786,7 +793,15 @@ class ProductionService:
         run = self._run(run_id)
         draft = self.adapter.draft_detail(str(run.draft_token)) if run.draft_token else None
         gates = self._gates(run, draft)
-        return {"ok": True, "run": run.to_dict(), "gates": gates, "draft": draft}
+        manifest = self.asset_manifests.describe_for_run(run_id)
+        return {
+            "ok": True,
+            "run": run.to_dict(),
+            "gates": gates,
+            "draft": draft,
+            "asset_manifest": manifest["reference"],
+            "asset_policy": manifest["policy"],
+        }
 
     def performance_preview(self, run_id: str) -> dict[str, Any]:
         """Build a read-only, task-local representation for the draft preview.

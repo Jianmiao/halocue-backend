@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 3
+RUNTIME_SCHEMA_VERSION = 4
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -140,6 +140,21 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
         "CREATE UNIQUE INDEX idx_workspace_files_hash ON workspace_files(content_hash)",
+    ),
+    4: (
+        """
+        CREATE TABLE asset_manifests (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL UNIQUE,
+          workspace_uri TEXT NOT NULL UNIQUE,
+          content_hash TEXT NOT NULL,
+          file_hash TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES production_runs(id),
+          FOREIGN KEY(workspace_uri) REFERENCES workspace_files(uri)
+        )
+        """,
     ),
 }
 
@@ -441,6 +456,140 @@ class RuntimeStore:
                     status=500,
                 )
             return self._workspace_file_payload(row)
+
+    @staticmethod
+    def _asset_manifest_payload(
+        row: sqlite3.Row, *, legacy_run_id: str
+    ) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "run_id": legacy_run_id,
+            "production_run_id": str(row["run_id"]),
+            "workspace_uri": str(row["workspace_uri"]),
+            "content_hash": str(row["content_hash"]),
+            "file_hash": str(row["file_hash"]),
+            "source_kind": str(row["source_kind"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def bind_asset_manifest(
+        self,
+        *,
+        legacy_run_id: str,
+        manifest_id: str,
+        workspace_uri: str,
+        content_hash: str,
+        file_hash: str,
+        source_kind: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        with self._transaction() as connection:
+            run = connection.execute(
+                "SELECT id FROM production_runs WHERE legacy_run_id=?",
+                (legacy_run_id,),
+            ).fetchone()
+            if run is None:
+                raise ProductionError("run_not_found", "制作任务不存在", status=404)
+            production_run_id = str(run["id"])
+            workspace_file = connection.execute(
+                "SELECT content_hash FROM workspace_files WHERE uri=?",
+                (workspace_uri,),
+            ).fetchone()
+            if workspace_file is None:
+                raise ProductionError(
+                    "workspace_file_not_found",
+                    "AssetManifest 工作区文件尚未登记",
+                    status=404,
+                    details={"uri": workspace_uri},
+                )
+            if str(workspace_file["content_hash"]) != file_hash:
+                raise ProductionError(
+                    "asset_manifest_file_hash_mismatch",
+                    "AssetManifest 文件哈希与工作区登记不一致",
+                    status=409,
+                    details={"uri": workspace_uri},
+                )
+            values = {
+                "id": manifest_id,
+                "run_id": production_run_id,
+                "workspace_uri": workspace_uri,
+                "content_hash": content_hash,
+                "file_hash": file_hash,
+                "source_kind": source_kind,
+                "created_at": created_at,
+            }
+            existing = connection.execute(
+                "SELECT * FROM asset_manifests WHERE run_id=?",
+                (production_run_id,),
+            ).fetchone()
+            if existing is not None:
+                if any(str(existing[key]) != str(value) for key, value in values.items()):
+                    raise ProductionError(
+                        "asset_manifest_conflict",
+                        "同一制作任务已冻结不同的 AssetManifest",
+                        status=409,
+                        details={
+                            "run_id": legacy_run_id,
+                            "existing_manifest_id": str(existing["id"]),
+                        },
+                    )
+                return self._asset_manifest_payload(
+                    existing, legacy_run_id=legacy_run_id
+                )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO asset_manifests(
+                      id, run_id, workspace_uri, content_hash, file_hash,
+                      source_kind, created_at
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (
+                        manifest_id,
+                        production_run_id,
+                        workspace_uri,
+                        content_hash,
+                        file_hash,
+                        source_kind,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ProductionError(
+                    "asset_manifest_conflict",
+                    "AssetManifest 身份或工作区 URI 已绑定其他制作任务",
+                    status=409,
+                    details={"run_id": legacy_run_id, "manifest_id": manifest_id},
+                ) from exc
+            row = connection.execute(
+                "SELECT * FROM asset_manifests WHERE run_id=?",
+                (production_run_id,),
+            ).fetchone()
+            return self._asset_manifest_payload(row, legacy_run_id=legacy_run_id)
+
+    def get_asset_manifest_for_run(
+        self, legacy_run_id: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT manifests.*
+                FROM asset_manifests AS manifests
+                JOIN production_runs AS runs ON runs.id=manifests.run_id
+                WHERE runs.legacy_run_id=?
+                """,
+                (legacy_run_id,),
+            ).fetchone()
+            return (
+                self._asset_manifest_payload(row, legacy_run_id=legacy_run_id)
+                if row
+                else None
+            )
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
 
     def save_production_run(
         self, payload: dict[str, Any]
