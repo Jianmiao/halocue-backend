@@ -7,6 +7,7 @@ import re
 import threading
 import uuid
 import zipfile
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,16 @@ from .asset_staging import (
     MAX_ARCHIVE_BYTES,
     MAX_ARCHIVE_FILES,
     AssetStaging,
+)
+from .adapters import (
+    AdapterRegistry,
+    AdapterRequest,
+    AzureArchiveAdapter,
+    BuildBundleAssembler,
+    DraftRef,
+    PerformanceDraftStore,
+    StoryForgeAdapter,
+    StoryForgeRenderer,
 )
 
 
@@ -86,6 +97,25 @@ class ProductionService:
             if configured_aa:
                 self.settings = replace(settings, aa_data=configured_aa)
         self.adapter = Legacy093Adapter(self.settings)
+        self.formal_drafts = PerformanceDraftStore(
+            self.artifacts, self.repository.runtime
+        )
+        self.build_bundles = BuildBundleAssembler(
+            self.artifacts, staging_root=self.settings.data_dir
+        )
+        self.production_adapters = AdapterRegistry(
+            [
+                AzureArchiveAdapter(
+                    self.adapter,
+                    self.formal_drafts,
+                    bundle_publisher=self.build_bundles,
+                ),
+                StoryForgeAdapter(
+                    StoryForgeRenderer(self.artifacts),
+                    self.formal_drafts,
+                ),
+            ]
+        )
         self.name_baseline = CharacterNameBaseline(self.settings.name_baseline)
         self.resources = ResourceCatalog(
             self.settings.resource_index,
@@ -203,6 +233,13 @@ class ProductionService:
             "idempotent": True,
         }
         return capabilities
+
+    def adapter_capabilities(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "contract": "AdapterCapabilities/1.0",
+            "adapters": self.production_adapters.all_capabilities(),
+        }
 
     @staticmethod
     def _upstream_script_release(
@@ -1892,6 +1929,172 @@ class ProductionService:
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict()), "build_id": build_id}
 
+    def _formal_adapter_request(
+        self,
+        request: dict[str, Any],
+        *,
+        target: str | None = None,
+        run_id: str | None = None,
+        work_item_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> AdapterRequest:
+        manifest = self.asset_manifests.validate_reference(request["asset_manifest"])
+        return AdapterRequest(
+            request,
+            asset_manifest=manifest,
+            target=target or request["production_policy"]["target"],
+            run_id=run_id,
+            work_item_id=work_item_id,
+            attempt_id=attempt_id,
+        )
+
+    def _load_formal_draft_revision(self, revision_id: str) -> DraftRef:
+        record = self.repository.runtime.get_formal_performance_draft_revision(
+            str(revision_id or "").strip()
+        )
+        if record is None:
+            raise ProductionError(
+                "performance_draft_not_found",
+                "PerformanceDraft Revision 不存在",
+                status=404,
+                details={"revision_id": str(revision_id or "")},
+            )
+        return self.formal_drafts.load(record["artifact_uri"])
+
+    def _adapter_result_payload(
+        self,
+        result: Any,
+        *,
+        request: AdapterRequest,
+        draft_ref: DraftRef,
+        adapter: Any,
+        target: str,
+        cancelled: callable,
+    ) -> dict[str, Any]:
+        cancelled()
+        payload = result.to_dict()
+        bundle_ref = result.bundle_ref
+        artifact_refs = tuple(result.artifact_refs)
+        if bundle_ref is not None:
+            verified = self.artifacts.get_artifact(bundle_ref.artifact_uri)
+            if verified.content_hash != bundle_ref.content_hash:
+                raise ProductionError(
+                    "build_bundle_hash_mismatch",
+                    "适配器返回的 BuildBundle 哈希校验失败",
+                    status=500,
+                )
+        elif artifact_refs:
+            deliverables = [self.artifacts.get_artifact(uri) for uri in artifact_refs]
+            capabilities = adapter.capabilities()
+            bundle = self.build_bundles.assemble(
+                request_id=request.request_id,
+                performance_draft_id=draft_ref.draft_id,
+                input_hashes={
+                    "script_release": request.input_hashes["script_release"],
+                    "performance_draft": draft_ref.content_hash,
+                    "asset_manifest": request.input_hashes["asset_manifest"],
+                },
+                producer={
+                    "adapter_id": str(capabilities["adapter_id"]),
+                    "engine_id": str(capabilities["engine_id"]),
+                    "engine_version": str(capabilities["engine_version"]),
+                },
+                target=target,
+                deliverables=deliverables,
+                created_at=utc_now(),
+                warnings=[{"code": "adapter_warning", "message": item} for item in result.warnings],
+                run_id=request.run_id,
+                work_item_id=request.work_item_id,
+                attempt_id=request.attempt_id,
+                cancelled=cancelled,
+            )
+            payload["bundle_ref"] = bundle.to_dict()
+            payload["artifact_refs"] = [bundle.artifact_uri]
+        cancelled()
+        return payload
+
+    def submit_adapter_operation(
+        self,
+        request: AdapterRequest,
+        draft_ref: DraftRef,
+        *,
+        operation: str,
+        options: Mapping[str, Any] | None = None,
+        work_item_id: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        if operation not in {"compile", "render"}:
+            raise ProductionError(
+                "adapter_operation_invalid",
+                "正式适配器任务只支持 compile 或 render",
+                status=400,
+                details={"operation": operation},
+            )
+        if not isinstance(request, AdapterRequest) or not isinstance(draft_ref, DraftRef):
+            raise ProductionError(
+                "adapter_input_invalid",
+                "正式适配器任务需要 AdapterRequest 和 DraftRef",
+                status=400,
+            )
+        safe_options = dict(options or {})
+        target = str(safe_options.get("target") or request.target).strip().casefold()
+        adapter = self.production_adapters.for_target(target)
+        adapter_id = str(adapter.capabilities()["adapter_id"])
+        input_hashes = {
+            "script_release": request.input_hashes["script_release"],
+            "performance_draft": draft_ref.content_hash,
+            "asset_manifest": request.input_hashes["asset_manifest"],
+        }
+        retry_context = {
+            "request_id": request.request_id,
+            "adapter_id": adapter_id,
+            "target": target,
+            "draft_revision_id": draft_ref.revision_id,
+            "input_hashes": input_hashes,
+        }
+        attempt_holder: dict[str, str | None] = {"attempt_id": None}
+
+        def cancel_adapter() -> None:
+            attempt_id = attempt_holder.get("attempt_id")
+            if attempt_id:
+                adapter.cancel(attempt_id)
+
+        def work(token: CancellationToken) -> dict[str, Any]:
+            attempt_holder["attempt_id"] = token.attempt_id
+            adapter_request = AdapterRequest(
+                request.production_request,
+                asset_manifest=request.asset_manifest,
+                target=request.target,
+                run_id=request.run_id,
+                work_item_id=work_item_id or request.work_item_id,
+                attempt_id=token.attempt_id,
+            )
+            token.raise_if_cancelled()
+            if operation == "compile":
+                result = adapter.compile(adapter_request, draft_ref)
+            else:
+                result = adapter.render(adapter_request, draft_ref, safe_options)
+            token.raise_if_cancelled()
+            return self._adapter_result_payload(
+                result,
+                request=adapter_request,
+                draft_ref=draft_ref,
+                adapter=adapter,
+                target=target,
+                cancelled=token.raise_if_cancelled,
+            )
+
+        model = adapter.capabilities()
+        job = self.jobs.submit(
+            f"adapter_{operation}",
+            work,
+            retry_context=retry_context,
+            work_item_id=work_item_id or request.work_item_id,
+            provider=str(model["engine_id"]),
+            model_or_engine=str(model["engine_version"]),
+            on_cancel=cancel_adapter,
+        )
+        return 202, {"ok": True, "job": self._job_public(job.to_dict())}
+
     def job_detail(self, job_id: str) -> dict[str, Any]:
         job = self.jobs.get(job_id)
         if not job:
@@ -1902,6 +2105,11 @@ class ProductionService:
         job = self.jobs.get(job_id)
         if not job:
             raise ProductionError("job_not_found", "后台任务不存在", status=404)
+        if job.kind in {"adapter_compile", "adapter_render"} and job.attempt_id:
+            context = job.retry_context if isinstance(job.retry_context, dict) else {}
+            adapter_id = str(context.get("adapter_id") or "").strip()
+            if adapter_id:
+                self.production_adapters.for_adapter(adapter_id).cancel(job.attempt_id)
         if not self.jobs.cancel(job_id):
             raise ProductionError(
                 "job_not_cancellable",
@@ -1935,7 +2143,56 @@ class ProductionService:
         context = job.retry_context if isinstance(job.retry_context, dict) else {}
         kind = job.kind
         run_id = job.run_id
-        if kind == "model_connection_test":
+        if kind in {"adapter_compile", "adapter_render"}:
+            required = {
+                "request_id",
+                "adapter_id",
+                "target",
+                "draft_revision_id",
+                "input_hashes",
+            }
+            if set(context) != required or not isinstance(context.get("input_hashes"), dict):
+                raise ProductionError(
+                    "job_retry_unavailable",
+                    "适配器任务缺少安全的冻结输入，无法重试",
+                    status=409,
+                    details={"kind": kind},
+                )
+            request_payload = self.formal_inputs.load_request(str(context["request_id"]))
+            request = self._formal_adapter_request(
+                request_payload,
+                target=request_payload["production_policy"]["target"],
+                work_item_id=job.work_item_id,
+            )
+            adapter = self.production_adapters.for_adapter(str(context["adapter_id"]))
+            routed = self.production_adapters.for_target(str(context["target"]))
+            if routed is not adapter:
+                raise ProductionError(
+                    "job_retry_input_conflict",
+                    "适配器任务的 target 与 adapter_id 不一致",
+                    status=409,
+                )
+            draft = self._load_formal_draft_revision(str(context["draft_revision_id"]))
+            stored_hashes = context["input_hashes"]
+            expected_hashes = {
+                "script_release": request.input_hashes["script_release"],
+                "performance_draft": draft.content_hash,
+                "asset_manifest": request.input_hashes["asset_manifest"],
+            }
+            if stored_hashes != expected_hashes:
+                raise ProductionError(
+                    "job_retry_input_conflict",
+                    "适配器任务的冻结输入哈希已经变化",
+                    status=409,
+                )
+            _, response = self.submit_adapter_operation(
+                request,
+                draft,
+                operation="compile" if kind == "adapter_compile" else "render",
+                options={"target": str(context["target"])},
+                work_item_id=job.work_item_id,
+            )
+        elif kind == "model_connection_test":
             _, response = self.test_direction_model(work_item_id=job.work_item_id)
         elif kind == "ai_preflight" and run_id:
             _, response = self.start_ai_preflight(run_id, work_item_id=job.work_item_id)
@@ -2003,6 +2260,17 @@ class ProductionService:
             kind == "model_connection_test"
             or (kind == "ai_preflight" and bool(job.get("run_id")))
             or (
+                kind in {"adapter_compile", "adapter_render"}
+                and set(retry_context)
+                == {
+                    "request_id",
+                    "adapter_id",
+                    "target",
+                    "draft_revision_id",
+                    "input_hashes",
+                }
+            )
+            or (
                 kind in {"cg_advice", "direction_generation", "compile"}
                 and bool(job.get("run_id"))
                 and "expected_draft_version" in retry_context
@@ -2018,13 +2286,15 @@ class ProductionService:
             "ai_preflight": "AI 初审（只读建议）",
             "model_connection_test": "测试演出模型连接",
             "cg_advice": "生成 CG 制作意见",
+            "adapter_compile": "适配器编译",
+            "adapter_render": "适配器渲染",
         }.get(kind, kind or "后台任务")
         if state == "succeeded":
             next_action = {"label": "已完成", "detail": "结果已写回关联任务。", "stage": None}
         elif state == "cancelled":
             next_action = {"label": "已取消", "detail": "已阻止该次任务提交结果。", "stage": None}
         elif state in {"failed", "abandoned", "interrupted"}:
-            stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation"} else None
+            stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation", "adapter_compile", "adapter_render"} else None
             next_action = {
                 "label": "查看失败原因并回到任务处理",
                 "detail": "修正问题后，从对应步骤重新提交；系统不会自动覆盖现有草稿。",

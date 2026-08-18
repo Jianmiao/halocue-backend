@@ -107,6 +107,14 @@ class StoryForgeAdapter(AdapterBase):
         self._validated(request, draft_ref)
         return AdapterResult()
 
+    def compile(
+        self,
+        request: AdapterRequest,
+        draft_ref: DraftRef,
+    ) -> AdapterResult:
+        self.require_capability("compile_aap", target=request.target)
+        raise AssertionError("StoryForge compile is not advertised")
+
     def render(
         self,
         request: AdapterRequest,

@@ -217,6 +217,30 @@ class FormalProductionInputs:
         self._verify_binding(binding)
         return self._description(binding)
 
+    def load_request(self, request_id: str) -> dict[str, Any]:
+        """Reload a frozen ProductionRequest for a persisted retry."""
+        normalized_id = str(request_id or "").strip()
+        binding = self.runtime.get_production_request(normalized_id)
+        if binding is None:
+            raise ProductionError(
+                "production_request_not_found",
+                "冻结的 ProductionRequest 不存在",
+                status=404,
+                details={"request_id": normalized_id},
+            )
+        self._verify_binding(binding)
+        try:
+            content = self.artifacts.read_bytes(binding["request_uri"])
+            raw = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ProductionError(
+                "production_request_corrupt",
+                "冻结的 ProductionRequest 无法读取",
+                status=500,
+                details={"request_id": normalized_id},
+            ) from exc
+        return self.validate_request(raw)
+
     def _verify_binding(self, binding: dict[str, Any]) -> None:
         artifact = self.artifacts.get(binding["request_uri"])
         if artifact.content_hash != binding["request_file_hash"]:
