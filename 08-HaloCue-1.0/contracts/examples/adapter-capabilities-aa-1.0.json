@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "adapter_api_version": "1.0",
+  "adapter_id": "aa-compat",
+  "engine_id": "azurearchive",
+  "engine_version": "0.9.3",
+  "capabilities": [
+    "preflight",
+    "create_performance_draft",
+    "update_performance_draft",
+    "validate",
+    "compile_aap",
+    "cancel",
+    "install_aap"
+  ],
+  "supported_script_manifest_versions": ["1.0", "1.1"],
+  "supported_performance_draft_versions": ["1.0"],
+  "supported_asset_manifest_versions": ["1.0"],
+  "supported_build_bundle_versions": ["1.0"],
+  "targets": ["pc_aap"]
+}

@@ -36,6 +36,11 @@ VERSIONED_EXAMPLES = {
     ("ProductionRequest", "1.1"): "production-request-1.1.json",
 }
 
+ADAPTER_CAPABILITY_EXAMPLES = (
+    "adapter-capabilities-aa-1.0.json",
+    "adapter-capabilities-storyforge-1.0.json",
+)
+
 
 def example(contract: str) -> dict:
     return json.loads((EXAMPLE_DIR / EXAMPLES[contract]).read_text(encoding="utf-8"))
@@ -44,6 +49,27 @@ def example(contract: str) -> dict:
 def versioned_example(contract: str, version: str) -> dict:
     filename = VERSIONED_EXAMPLES[(contract, version)]
     return json.loads((EXAMPLE_DIR / filename).read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("filename", ADAPTER_CAPABILITY_EXAMPLES)
+def test_adapter_capability_examples_validate_and_round_trip(filename):
+    payload = json.loads((EXAMPLE_DIR / filename).read_text(encoding="utf-8"))
+
+    normalized = validate_contract("AdapterCapabilities", payload)
+
+    assert normalized == payload
+    assert json.loads(json.dumps(normalized, ensure_ascii=False)) == payload
+
+
+def test_adapter_capabilities_reject_legacy_render_video_operation():
+    payload = example("AdapterCapabilities")
+    payload["capabilities"].append("render_video")
+
+    with pytest.raises(ContractValidationError) as raised:
+        validate_contract("AdapterCapabilities", payload)
+
+    assert raised.value.code == "invalid_contract"
+    assert raised.value.path == "$.capabilities[" + str(len(payload["capabilities"]) - 1) + "]"
 
 
 @pytest.mark.parametrize("contract", CONTRACT_NAMES)
