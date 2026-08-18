@@ -24,6 +24,13 @@
 | `ProductionEvent/1.0` | `examples/production-event-1.0.json` | Run/WorkItem/Attempt 关联的单调事件 |
 | `ApiError/1.0` | `examples/api-error-1.0.json` | 可分类、可决策重试、不泄漏私密数据的错误 |
 
+能力发现使用 `GET /api/v1/production-adapters`。外层响应包含
+`contract: "AdapterCapabilities/1.0"` 和适配器数组；数组中的每个对象
+都必须通过 `AdapterCapabilities/1.0` 校验。能力发现只返回稳定标识、引擎
+版本、支持的操作、目标和输入合同版本，不返回 AA 私有 token、模型密钥、
+草稿正文、本机绝对路径或构建目录。`render_video` 不是正式操作名；视频
+导出能力使用 `export_video` 并由适配器明确声明。
+
 ## PerformanceDraft 约束
 
 - `scenes[].nodes[]` 显式区分演出行和选择组，Scene、node、line、choice group 和 branch 都使用稳定 UUID。

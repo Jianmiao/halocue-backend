@@ -149,6 +149,8 @@ class ProductionHandler(BaseHTTPRequestHandler):
             return 200, self.service.health()
         if method == "GET" and path == "/api/v1/capabilities":
             return 200, {"ok": True, "capabilities": self.service.capabilities()}
+        if method == "GET" and path == "/api/v1/production-adapters":
+            return 200, self.service.adapter_capabilities()
         if path == "/api/v1/settings/direction-model":
             if method == "GET":
                 return 200, self.service.direction_model_settings_public()

@@ -8,6 +8,7 @@ import urllib.request
 from contextlib import contextmanager
 
 from halocue_production.app import create_server
+from halocue_production.contracts import validate_contract
 from halocue_production.service import ProductionService
 from test_formal_inputs import formal_request
 from test_service import configured_resource_settings
@@ -74,6 +75,27 @@ def test_http_accepts_idempotent_production_request_1_1(settings):
         assert status == 200
         assert repeated["run"]["run_id"] == created["run"]["run_id"]
         assert repeated["handoff"]["idempotent"] is True
+
+
+def test_http_exposes_formal_production_adapter_capabilities(settings):
+    with api(settings) as base:
+        status, headers, result = request(base, "/api/v1/production-adapters")
+
+    assert status == 200
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert result["ok"] is True
+    assert result["contract"] == "AdapterCapabilities/1.0"
+    for capability in result["adapters"]:
+        validate_contract("AdapterCapabilities", capability)
+    adapters = {item["adapter_id"]: item for item in result["adapters"]}
+    assert adapters["aa-compat"]["targets"] == ["pc_aap"]
+    assert adapters["storyforge-local"]["targets"] == ["storyforge_preview"]
+    assert "compile_aap" not in adapters["storyforge-local"]["capabilities"]
+    public = json.dumps(result, ensure_ascii=False)
+    assert str(settings.data_dir) not in public
+    assert "legacy_root" not in public
+    assert "aa_data" not in public
+    assert "token" not in public.casefold()
 
 
 def test_http_maps_formal_request_version_error_to_stable_api_error(settings):

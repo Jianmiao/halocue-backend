@@ -150,9 +150,19 @@ client filesystem paths are not accepted by this first slice.
 ```text
 GET  /api/v1/health
 GET  /api/v1/capabilities
+GET  /api/v1/production-adapters
 GET  /api/v1/settings/aa-workspace
 POST /api/v1/settings/aa-workspace
 ```
+
+`GET /api/v1/production-adapters` returns the normalized
+`AdapterCapabilities/1.0` documents for the locally registered production
+adapters. The response lists only stable adapter IDs, engine metadata,
+supported operations, contract versions, and targets. It never returns AA
+private tokens, model secrets, draft text, local absolute paths, or build
+directories. A missing capability is reported as a structured
+`adapter_capability_unavailable` error; the endpoint does not imply that every
+listed capability is configured for the current machine.
 
 The settings request is `{"path":"E:\\AzureArchive\\...\\data"}`. A valid
 workspace must contain `projects`, `saves`, `overrides`, and `settings`.
