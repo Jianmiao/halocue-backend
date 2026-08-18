@@ -16,6 +16,7 @@ from .drafts import (
 )
 from .aa import AzureArchiveAdapter
 from .storyforge import StoryForgeAdapter, StoryForgeRenderer
+from .bundles import BuildBundleAssembler, DeliverableInput
 
 __all__ = [
     "AdapterBase",
@@ -31,4 +32,6 @@ __all__ = [
     "AzureArchiveAdapter",
     "StoryForgeAdapter",
     "StoryForgeRenderer",
+    "BuildBundleAssembler",
+    "DeliverableInput",
 ]
