@@ -262,8 +262,10 @@ class AdapterResult:
     """Result envelope containing references only, never a physical path."""
 
     bundle_ref: BuildBundleRef | None = None
+    draft_ref: DraftRef | None = None
     artifact_refs: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    diagnostics: tuple[dict[str, Any], ...] = ()
     cancelled: bool = False
 
     def __post_init__(self) -> None:
@@ -272,6 +274,21 @@ class AdapterResult:
         )
         object.__setattr__(self, "artifact_refs", refs)
         object.__setattr__(self, "warnings", tuple(str(item) for item in self.warnings))
+        normalized_diagnostics: list[dict[str, Any]] = []
+        for item in self.diagnostics:
+            if not isinstance(item, Mapping):
+                raise ValueError("adapter diagnostics must be objects")
+            allowed = {"code", "severity", "message"}
+            if set(item) - allowed:
+                raise ValueError("adapter diagnostics contain unsupported fields")
+            normalized_diagnostics.append(
+                {
+                    "code": str(item.get("code") or "diagnostic"),
+                    "severity": str(item.get("severity") or "info"),
+                    "message": str(item.get("message") or ""),
+                }
+            )
+        object.__setattr__(self, "diagnostics", tuple(normalized_diagnostics))
         if self.cancelled and (self.bundle_ref is not None or refs):
             raise ValueError("cancelled adapter results cannot contain artifacts")
 
@@ -282,8 +299,10 @@ class AdapterResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "bundle_ref": self.bundle_ref.to_dict() if self.bundle_ref else None,
+            "draft_ref": self.draft_ref.to_dict() if self.draft_ref else None,
             "artifact_refs": list(self.artifact_refs),
             "warnings": list(self.warnings),
+            "diagnostics": [dict(item) for item in self.diagnostics],
             "cancelled": self.cancelled,
         }
 

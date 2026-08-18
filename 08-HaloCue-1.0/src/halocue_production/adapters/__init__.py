@@ -14,6 +14,7 @@ from .drafts import (
     PerformanceDraftStore,
     StandardDraftStore,
 )
+from .aa import AzureArchiveAdapter
 
 __all__ = [
     "AdapterBase",
@@ -26,4 +27,5 @@ __all__ = [
     "FormalPerformanceDraftStore",
     "PerformanceDraftStore",
     "StandardDraftStore",
+    "AzureArchiveAdapter",
 ]
