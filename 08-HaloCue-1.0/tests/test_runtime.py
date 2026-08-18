@@ -73,6 +73,28 @@ def test_runtime_store_creates_current_schema(tmp_path):
     } <= tables
 
 
+def test_runtime_store_upgrades_v6_to_v7_with_immutable_artifact_refs(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    RuntimeStore(path, target_version=6)
+    runtime = RuntimeStore(path)
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(artifact_refs)")
+        }
+
+    assert runtime.schema_version() == 7
+    assert {
+        "uri",
+        "workspace_uri",
+        "kind",
+        "content_hash",
+        "run_id",
+        "work_item_id",
+        "attempt_id",
+        "created_at",
+    } <= columns
+
+
 def test_runtime_store_upgrades_v1_to_current(tmp_path):
     path = tmp_path / "runtime.sqlite3"
     RuntimeStore(path, target_version=1)

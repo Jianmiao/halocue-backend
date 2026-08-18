@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 6
+RUNTIME_SCHEMA_VERSION = 7
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -261,6 +261,26 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
         "CREATE INDEX idx_frozen_script_releases_content_hash ON frozen_script_releases(content_hash)",
+    ),
+    7: (
+        """
+        CREATE TABLE artifact_refs (
+          uri TEXT PRIMARY KEY,
+          workspace_uri TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          run_id TEXT,
+          work_item_id TEXT,
+          attempt_id TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(workspace_uri) REFERENCES workspace_files(uri),
+          FOREIGN KEY(run_id) REFERENCES production_runs(id),
+          FOREIGN KEY(work_item_id) REFERENCES work_items(id),
+          FOREIGN KEY(attempt_id) REFERENCES job_attempts(id)
+        )
+        """,
+        "CREATE INDEX idx_artifact_refs_workspace ON artifact_refs(workspace_uri)",
+        "CREATE INDEX idx_artifact_refs_attempt ON artifact_refs(attempt_id)",
     ),
 }
 
@@ -562,6 +582,132 @@ class RuntimeStore:
                     status=500,
                 )
             return self._workspace_file_payload(row)
+
+    @staticmethod
+    def _artifact_ref_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "uri": str(row["uri"]),
+            "workspace_uri": str(row["workspace_uri"]),
+            "kind": str(row["kind"]),
+            "content_hash": str(row["content_hash"]),
+            "run_id": row["run_id"],
+            "work_item_id": row["work_item_id"],
+            "attempt_id": row["attempt_id"],
+            "created_at": str(row["created_at"]),
+        }
+
+    def register_artifact_ref(
+        self,
+        *,
+        uri: str,
+        workspace_uri: str,
+        kind: str,
+        content_hash: str,
+        run_id: str | None = None,
+        work_item_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._transaction() as connection:
+            workspace = connection.execute(
+                "SELECT content_hash FROM workspace_files WHERE uri=?",
+                (workspace_uri,),
+            ).fetchone()
+            if workspace is None:
+                raise ProductionError(
+                    "workspace_file_not_found",
+                    "artifact 引用的工作区文件尚未登记",
+                    status=404,
+                    details={"uri": workspace_uri},
+                )
+            if str(workspace["content_hash"]) != content_hash:
+                raise ProductionError(
+                    "artifact_hash_mismatch",
+                    "artifact 引用哈希与工作区登记不一致",
+                    status=409,
+                    details={"uri": workspace_uri},
+                )
+            existing = connection.execute(
+                "SELECT * FROM artifact_refs WHERE uri=?", (uri,)
+            ).fetchone()
+            if existing is not None:
+                immutable = {
+                    "workspace_uri": workspace_uri,
+                    "kind": kind,
+                    "content_hash": content_hash,
+                    "run_id": run_id,
+                    "work_item_id": work_item_id,
+                    "attempt_id": attempt_id,
+                }
+                if any(str(existing[key]) != str(value) for key, value in immutable.items()):
+                    raise ProductionError(
+                        "artifact_ref_conflict",
+                        "同一 artifact URI 已登记不同内容或来源",
+                        status=409,
+                        details={"uri": uri},
+                    )
+                return self._artifact_ref_payload(existing)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO artifact_refs(
+                      uri, workspace_uri, kind, content_hash,
+                      run_id, work_item_id, attempt_id, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        uri,
+                        workspace_uri,
+                        kind,
+                        content_hash,
+                        run_id,
+                        work_item_id,
+                        attempt_id,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ProductionError(
+                    "artifact_ref_conflict",
+                    "artifact URI 或关联运行记录已被占用",
+                    status=409,
+                    details={"uri": uri},
+                ) from exc
+            row = connection.execute(
+                "SELECT * FROM artifact_refs WHERE uri=?", (uri,)
+            ).fetchone()
+            if row is None:
+                raise ProductionError(
+                    "artifact_ref_registration_failed",
+                    "artifact 引用登记失败",
+                    status=500,
+                )
+            return self._artifact_ref_payload(row)
+
+    def get_artifact_ref(self, uri: str) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM artifact_refs WHERE uri=?", (uri,)
+            ).fetchone()
+            return self._artifact_ref_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def list_artifact_refs_for_attempt(self, attempt_id: str) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM artifact_refs WHERE attempt_id=? ORDER BY created_at, uri",
+                (attempt_id,),
+            ).fetchall()
+            return [self._artifact_ref_payload(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
 
     @staticmethod
     def _asset_manifest_payload(row: sqlite3.Row) -> dict[str, Any]:

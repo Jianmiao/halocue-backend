@@ -44,6 +44,91 @@ def test_commit_bytes_is_hashed_registered_and_restart_safe(tmp_path):
     assert restarted.get(uri).content_hash == record.content_hash
 
 
+def test_publish_artifact_reuses_registered_workspace_bytes_and_is_restart_safe(tmp_path):
+    store, runtime = artifact_store(tmp_path)
+    workspace = store.commit_bytes(
+        "workspace://builds/11111111-1111-4111-8111-111111111111/bundle.json",
+        b"{}",
+        kind="build-bundle",
+        media_type="application/json",
+    )
+
+    published = store.publish_artifact(
+        "builds",
+        "22222222-2222-4222-8222-222222222222",
+        workspace,
+    )
+
+    assert published.uri == "artifact://builds/22222222-2222-4222-8222-222222222222"
+    assert published.workspace_uri == workspace.uri
+    assert published.content_hash == workspace.content_hash
+    assert published.attempt_id is None
+    assert store.read_artifact_bytes(published.uri) == b"{}"
+
+    restarted = ArtifactStore(
+        tmp_path / "workspace", RuntimeStore(tmp_path / "runtime.sqlite3")
+    )
+    assert restarted.get_artifact(published.uri).content_hash == workspace.content_hash
+
+
+def test_publish_artifact_rejects_conflicting_alias_and_unregistered_workspace(tmp_path):
+    store, _ = artifact_store(tmp_path)
+    workspace = store.commit_bytes(
+        "workspace://builds/first/bundle.json", b"first", kind="build-bundle"
+    )
+    store.publish_artifact("builds", "44444444-4444-4444-8444-444444444444", workspace)
+
+    with pytest.raises(ProductionError) as raised:
+        store.publish_artifact(
+            "builds",
+            "44444444-4444-4444-8444-444444444444",
+            store.commit_bytes(
+                "workspace://builds/second/bundle.json",
+                b"second",
+                kind="build-bundle",
+            ),
+        )
+    assert raised.value.code == "artifact_ref_conflict"
+
+    with pytest.raises(ProductionError) as raised:
+        store.publish_artifact(
+            "builds",
+            "55555555-5555-4555-8555-555555555555",
+            type(workspace)(
+                uri="workspace://missing/file.json",
+                relative_path="missing/file.json",
+                kind="build-bundle",
+                content_hash=workspace.content_hash,
+                size_bytes=workspace.size_bytes,
+                media_type=workspace.media_type,
+                metadata={},
+                created_at=workspace.created_at,
+                updated_at=workspace.updated_at,
+            ),
+        )
+    assert raised.value.code == "workspace_file_not_found"
+
+
+@pytest.mark.parametrize(
+    ("namespace", "artifact_id"),
+    [
+        ("../builds", "66666666-6666-4666-8666-666666666666"),
+        ("builds", "../66666666-6666-4666-8666-666666666666"),
+        ("builds", "not-a-uuid"),
+    ],
+)
+def test_publish_artifact_rejects_invalid_alias_identity(tmp_path, namespace, artifact_id):
+    store, _ = artifact_store(tmp_path)
+    workspace = store.commit_bytes(
+        "workspace://builds/valid/bundle.json", b"valid", kind="build-bundle"
+    )
+
+    with pytest.raises(ProductionError) as raised:
+        store.publish_artifact(namespace, artifact_id, workspace)
+
+    assert raised.value.code == "artifact_uri_invalid"
+
+
 def test_commit_file_is_idempotent_and_refuses_different_bytes(tmp_path):
     store, _ = artifact_store(tmp_path)
     source = tmp_path / "source.bin"

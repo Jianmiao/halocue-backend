@@ -63,6 +63,43 @@ class WorkspaceFile:
         }
 
 
+@dataclass(frozen=True)
+class ArtifactRef:
+    uri: str
+    workspace_uri: str
+    kind: str
+    content_hash: str
+    run_id: str | None
+    work_item_id: str | None
+    attempt_id: str | None
+    created_at: str
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ArtifactRef":
+        return cls(
+            uri=str(value["uri"]),
+            workspace_uri=str(value["workspace_uri"]),
+            kind=str(value["kind"]),
+            content_hash=str(value["content_hash"]),
+            run_id=value.get("run_id"),
+            work_item_id=value.get("work_item_id"),
+            attempt_id=value.get("attempt_id"),
+            created_at=str(value["created_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "uri": self.uri,
+            "workspace_uri": self.workspace_uri,
+            "kind": self.kind,
+            "content_hash": self.content_hash,
+            "run_id": self.run_id,
+            "work_item_id": self.work_item_id,
+            "attempt_id": self.attempt_id,
+            "created_at": self.created_at,
+        }
+
+
 class ArtifactStore:
     """Commit workspace files without exposing physical paths as domain data."""
 
@@ -198,6 +235,65 @@ class ArtifactStore:
                 details={"uri": normalized_uri, "expected_hash": record["content_hash"]},
             )
         return content
+
+    def publish_artifact(
+        self,
+        namespace: str,
+        artifact_id: str,
+        workspace_file: WorkspaceFile,
+        *,
+        provenance: dict[str, str | None] | None = None,
+    ) -> ArtifactRef:
+        normalized_namespace = self._artifact_namespace(namespace)
+        normalized_id = self._artifact_id(artifact_id)
+        verified_file = self.get(workspace_file.uri)
+        provenance = {} if provenance is None else dict(provenance)
+        allowed = {"run_id", "work_item_id", "attempt_id"}
+        if set(provenance) - allowed:
+            raise ProductionError(
+                "artifact_provenance_invalid",
+                "artifact 来源元数据包含不支持的字段",
+                status=400,
+            )
+        refs = {
+            key: self._optional_uuid(provenance.get(key))
+            for key in allowed
+        }
+        uri = f"artifact://{normalized_namespace}/{normalized_id}"
+        record = self.runtime.register_artifact_ref(
+            uri=uri,
+            workspace_uri=verified_file.uri,
+            kind=verified_file.kind,
+            content_hash=verified_file.content_hash,
+            run_id=refs["run_id"],
+            work_item_id=refs["work_item_id"],
+            attempt_id=refs["attempt_id"],
+        )
+        return ArtifactRef.from_dict(record)
+
+    def get_artifact(self, uri: str) -> ArtifactRef:
+        normalized_uri = self._artifact_uri(uri)
+        record = self.runtime.get_artifact_ref(normalized_uri)
+        if record is None:
+            raise ProductionError(
+                "artifact_ref_not_found",
+                "artifact 引用尚未登记",
+                status=404,
+                details={"uri": normalized_uri},
+            )
+        workspace = self.get(str(record["workspace_uri"]))
+        if workspace.content_hash != str(record["content_hash"]):
+            raise ProductionError(
+                "artifact_hash_mismatch",
+                "artifact 引用哈希与工作区文件不一致",
+                status=500,
+                details={"uri": normalized_uri},
+            )
+        return ArtifactRef.from_dict(record)
+
+    def read_artifact_bytes(self, uri: str) -> bytes:
+        artifact = self.get_artifact(uri)
+        return self.read_bytes(artifact.workspace_uri)
 
     def _commit(
         self,
@@ -351,6 +447,102 @@ class ArtifactStore:
         relative_path = "/".join((namespace, *parts))
         target = self._safe_target(relative_path)
         return normalized_uri, relative_path, target
+
+    @staticmethod
+    def _artifact_namespace(value: Any) -> str:
+        text = str(value or "").strip().casefold()
+        if not _IDENTIFIER.fullmatch(text):
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 命名空间无效",
+                status=400,
+            )
+        return text
+
+    @staticmethod
+    def _artifact_id(value: Any) -> str:
+        text = str(value or "").strip()
+        try:
+            parsed = uuid.UUID(text)
+        except (ValueError, AttributeError) as exc:
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 必须使用 canonical UUID",
+                status=400,
+            ) from exc
+        if str(parsed) != text:
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 必须使用 canonical UUID",
+                status=400,
+            )
+        return text
+
+    @classmethod
+    def _artifact_uri(cls, uri: Any) -> str:
+        text = str(uri or "").strip()
+        if not text or len(text) > 512:
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 无效",
+                status=400,
+            )
+        decoded = text
+        for _ in range(16):
+            next_value = unquote(decoded)
+            if next_value == decoded:
+                break
+            decoded = next_value
+        else:
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 不得包含多重编码",
+                status=400,
+            )
+        parsed = urlsplit(decoded)
+        parts = parsed.path.split("/")[1:]
+        if (
+            parsed.scheme != "artifact"
+            or parsed.query
+            or parsed.fragment
+            or "\\" in decoded
+            or len(parts) != 1
+        ):
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 无效或包含路径穿越",
+                status=400,
+            )
+        namespace = cls._artifact_namespace(parsed.netloc)
+        if any(part in {"", ".", ".."} for part in parts):
+            raise ProductionError(
+                "artifact_uri_invalid",
+                "artifact URI 无效或包含路径穿越",
+                status=400,
+            )
+        artifact_id = cls._artifact_id(parts[0])
+        return f"artifact://{namespace}/{artifact_id}"
+
+    @staticmethod
+    def _optional_uuid(value: Any) -> str | None:
+        if value is None or str(value).strip() == "":
+            return None
+        text = str(value).strip()
+        try:
+            parsed = uuid.UUID(text)
+        except (ValueError, AttributeError) as exc:
+            raise ProductionError(
+                "artifact_provenance_invalid",
+                "artifact 来源 ID 必须是 canonical UUID",
+                status=400,
+            ) from exc
+        if str(parsed) != text:
+            raise ProductionError(
+                "artifact_provenance_invalid",
+                "artifact 来源 ID 必须是 canonical UUID",
+                status=400,
+            )
+        return text
 
     def _safe_target(self, relative_path: str) -> Path:
         target = self.root.joinpath(*relative_path.split("/"))
