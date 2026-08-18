@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 7
+RUNTIME_SCHEMA_VERSION = 8
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -281,6 +281,27 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX idx_artifact_refs_workspace ON artifact_refs(workspace_uri)",
         "CREATE INDEX idx_artifact_refs_attempt ON artifact_refs(attempt_id)",
+    ),
+    8: (
+        """
+        CREATE TABLE formal_performance_drafts (
+          revision_id TEXT PRIMARY KEY,
+          draft_id TEXT NOT NULL,
+          run_id TEXT,
+          request_id TEXT,
+          artifact_uri TEXT NOT NULL UNIQUE,
+          content_hash TEXT NOT NULL,
+          review_status TEXT NOT NULL,
+          parent_revision_id TEXT,
+          adapter_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES production_runs(id),
+          FOREIGN KEY(artifact_uri) REFERENCES artifact_refs(uri),
+          FOREIGN KEY(parent_revision_id) REFERENCES formal_performance_drafts(revision_id)
+        )
+        """,
+        "CREATE INDEX idx_formal_performance_drafts_head ON formal_performance_drafts(draft_id, created_at)",
+        "CREATE INDEX idx_formal_performance_drafts_request ON formal_performance_drafts(request_id)",
     ),
 }
 
@@ -704,6 +725,215 @@ class RuntimeStore:
                 (attempt_id,),
             ).fetchall()
             return [self._artifact_ref_payload(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _formal_performance_draft_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "revision_id": str(row["revision_id"]),
+            "draft_id": str(row["draft_id"]),
+            "run_id": row["run_id"],
+            "request_id": row["request_id"],
+            "artifact_uri": str(row["artifact_uri"]),
+            "content_hash": str(row["content_hash"]),
+            "review_status": str(row["review_status"]),
+            "parent_revision_id": row["parent_revision_id"],
+            "adapter_id": str(row["adapter_id"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _formal_performance_draft_head_row(
+        connection: sqlite3.Connection, draft_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT * FROM formal_performance_drafts
+            WHERE draft_id=?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (draft_id,),
+        ).fetchone()
+
+    def register_formal_performance_draft(
+        self,
+        *,
+        revision_id: str,
+        draft_id: str,
+        artifact_uri: str,
+        content_hash: str,
+        review_status: str,
+        adapter_id: str,
+        created_at: str,
+        run_id: str | None = None,
+        request_id: str | None = None,
+        parent_revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        values = {
+            "draft_id": draft_id,
+            "run_id": run_id,
+            "request_id": request_id,
+            "artifact_uri": artifact_uri,
+            "content_hash": content_hash,
+            "review_status": review_status,
+            "parent_revision_id": parent_revision_id,
+            "adapter_id": adapter_id,
+            "created_at": created_at,
+        }
+        with self._transaction() as connection:
+            artifact = connection.execute(
+                "SELECT kind FROM artifact_refs WHERE uri=?", (artifact_uri,)
+            ).fetchone()
+            if artifact is None:
+                raise ProductionError(
+                    "artifact_ref_not_found",
+                    "PerformanceDraft 的 artifact 引用尚未登记",
+                    status=404,
+                    details={"uri": artifact_uri},
+                )
+            if str(artifact["kind"]) != "performance-draft":
+                raise ProductionError(
+                    "performance_draft_artifact_invalid",
+                    "artifact 引用不是 PerformanceDraft",
+                    status=409,
+                    details={"uri": artifact_uri},
+                )
+            existing = connection.execute(
+                "SELECT * FROM formal_performance_drafts WHERE revision_id=?",
+                (revision_id,),
+            ).fetchone()
+            if existing is not None:
+                if any(str(existing[key]) != str(value) for key, value in values.items()):
+                    raise ProductionError(
+                        "performance_draft_revision_identity_conflict",
+                        "同一 PerformanceDraft Revision ID 已登记不同内容",
+                        status=409,
+                        details={"revision_id": revision_id},
+                    )
+                return self._formal_performance_draft_payload(existing)
+            head = self._formal_performance_draft_head_row(connection, draft_id)
+            if parent_revision_id is None:
+                if head is not None:
+                    raise ProductionError(
+                        "performance_draft_identity_conflict",
+                        "同一 PerformanceDraft ID 已存在不同初始 Revision",
+                        status=409,
+                        details={
+                            "draft_id": draft_id,
+                            "current_revision_id": str(head["revision_id"]),
+                        },
+                    )
+            elif head is None or str(head["revision_id"]) != parent_revision_id:
+                raise ProductionError(
+                    "performance_draft_revision_conflict",
+                    "PerformanceDraft 已被其他操作更新",
+                    status=409,
+                    details={
+                        "draft_id": draft_id,
+                        "expected_revision_id": parent_revision_id,
+                        "current_revision_id": (
+                            str(head["revision_id"]) if head is not None else None
+                        ),
+                    },
+                )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO formal_performance_drafts(
+                      revision_id, draft_id, run_id, request_id, artifact_uri,
+                      content_hash, review_status, parent_revision_id,
+                      adapter_id, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        revision_id,
+                        draft_id,
+                        run_id,
+                        request_id,
+                        artifact_uri,
+                        content_hash,
+                        review_status,
+                        parent_revision_id,
+                        adapter_id,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ProductionError(
+                    "performance_draft_revision_conflict",
+                    "PerformanceDraft Revision 或 artifact 引用已被占用",
+                    status=409,
+                    details={
+                        "draft_id": draft_id,
+                        "revision_id": revision_id,
+                    },
+                ) from exc
+            row = connection.execute(
+                "SELECT * FROM formal_performance_drafts WHERE revision_id=?",
+                (revision_id,),
+            ).fetchone()
+            return self._formal_performance_draft_payload(row)
+
+    def get_formal_performance_draft_revision(
+        self, revision_id: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM formal_performance_drafts WHERE revision_id=?",
+                (revision_id,),
+            ).fetchone()
+            return self._formal_performance_draft_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def get_formal_performance_draft_by_artifact(
+        self, artifact_uri: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM formal_performance_drafts WHERE artifact_uri=?",
+                (artifact_uri,),
+            ).fetchone()
+            return self._formal_performance_draft_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def get_formal_performance_draft_head(
+        self, draft_id: str
+    ) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = self._formal_performance_draft_head_row(connection, draft_id)
+            return self._formal_performance_draft_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def list_formal_performance_draft_revisions(
+        self, draft_id: str
+    ) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM formal_performance_drafts
+                WHERE draft_id=?
+                ORDER BY rowid
+                """,
+                (draft_id,),
+            ).fetchall()
+            return [self._formal_performance_draft_payload(row) for row in rows]
         except sqlite3.DatabaseError as exc:
             raise self._database_error(exc) from exc
         finally:

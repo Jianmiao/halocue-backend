@@ -86,6 +86,10 @@ class AdapterRequest:
     script_release: dict[str, Any] | None
     asset_manifest: dict[str, Any] | None
     target: str
+    run_id: str | None
+    work_item_id: str | None
+    attempt_id: str | None
+    cancelled: bool
 
     def __init__(
         self,
@@ -95,6 +99,10 @@ class AdapterRequest:
         script_release: Mapping[str, Any] | None = None,
         asset_manifest: Mapping[str, Any] | None = None,
         target: str | None = None,
+        run_id: str | None = None,
+        work_item_id: str | None = None,
+        attempt_id: str | None = None,
+        cancelled: bool = False,
     ) -> None:
         if production_request is not None and request is not None:
             raise TypeError("provide production_request or request, not both")
@@ -133,6 +141,20 @@ class AdapterRequest:
         object.__setattr__(self, "script_release", normalized_release)
         object.__setattr__(self, "asset_manifest", normalized_manifest)
         object.__setattr__(self, "target", normalized_target)
+        object.__setattr__(
+            self, "run_id", _uuid(run_id, "run_id") if run_id is not None else None
+        )
+        object.__setattr__(
+            self,
+            "work_item_id",
+            _uuid(work_item_id, "work_item_id") if work_item_id is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "attempt_id",
+            _uuid(attempt_id, "attempt_id") if attempt_id is not None else None,
+        )
+        object.__setattr__(self, "cancelled", bool(cancelled))
 
     @property
     def request_id(self) -> str:
@@ -166,6 +188,7 @@ class DraftRef:
     artifact_uri: str
     content_hash: str
     review_status: str = "approved"
+    adapter_id: str | None = None
     payload: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -179,6 +202,8 @@ class DraftRef:
         object.__setattr__(self, "content_hash", _hash(self.content_hash, "content_hash"))
         if self.review_status not in {"draft", "pending_review", "approved", "rejected"}:
             raise ValueError("review_status is not supported")
+        if self.adapter_id is not None:
+            object.__setattr__(self, "adapter_id", _identifier(self.adapter_id, "adapter_id"))
         if self.payload is not None:
             normalized = validate_contract("PerformanceDraft", _copy_payload(self.payload))
             object.__setattr__(self, "payload", normalized)
@@ -194,6 +219,7 @@ class DraftRef:
             "artifact_uri": self.artifact_uri,
             "content_hash": self.content_hash,
             "review_status": self.review_status,
+            "adapter_id": self.adapter_id,
         }
 
 
