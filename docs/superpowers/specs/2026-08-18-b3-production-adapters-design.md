@@ -87,7 +87,7 @@ target. The initial matrix is:
 | `validate` | AA format and resource checks | StoryForge render/resource checks |
 | `compile_aap` | available when compiler/environment exists | unavailable |
 | `render_preview` | unavailable as an AA side effect | available |
-| `render_video` | unavailable | available through the local renderer boundary |
+| `export_video` | unavailable | available through the local renderer boundary |
 | `cancel` | cooperative/child-process cancellation | cooperative cancellation |
 | `install_aap` | separate explicit operation | unavailable |
 
