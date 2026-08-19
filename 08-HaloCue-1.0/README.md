@@ -153,6 +153,12 @@ All endpoints are under `/api/v1`. Errors use stable codes:
 {"ok": false, "error": {"code": "review_pending", "message": "...", "details": {}}}
 ```
 
+The compatibility wrapper above is the default. Clients that have adopted the
+formal error contract may send
+`Accept: application/vnd.halocue.api-error+json; version=1.0` to receive a
+direct `ApiError/1.0` object. The negotiated view never includes raw exception
+details, local paths, credentials, or private source text.
+
 The service binds to `127.0.0.1` by default and sends restrictive local-app
 security headers. Source text is accepted only in request bodies; arbitrary
 client filesystem paths are not accepted by this first slice.
@@ -175,6 +181,14 @@ private tokens, model secrets, draft text, local absolute paths, or build
 directories. A missing capability is reported as a structured
 `adapter_capability_unavailable` error; the endpoint does not imply that every
 listed capability is configured for the current machine.
+
+This endpoint is capability discovery only. There is no direct, unversioned
+HTTP compile/render adapter route. Formal adapter operations are submitted by
+the local composition layer through the validated `AdapterRequest` and
+`PerformanceDraft` boundary, persisted as jobs, and exposed through the
+existing versioned job routes. Adding a public adapter operation requires a
+versioned request/response contract, idempotency rule, unknown-version
+rejection, and `ApiError/1.0` mapping first.
 
 The settings request is `{"path":"E:\\AzureArchive\\...\\data"}`. A valid
 workspace must contain `projects`, `saves`, `overrides`, and `settings`.
