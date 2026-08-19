@@ -98,12 +98,19 @@ class DirectionModelGateway:
         try:
             module = importlib.import_module("llm")
             return module.make_provider_from_settings(provider_name, provider_settings)
-        except ProductionError:
-            raise
+        except ProductionError as exc:
+            if exc.code == "operation_cancelled":
+                raise
+            raise ProductionError(
+                "model_provider_unavailable",
+                "模型提供方不可用，请检查模型配置和网络",
+                status=503,
+                details={"type": type(exc).__name__},
+            ) from exc
         except Exception as exc:
             raise ProductionError(
                 "model_provider_unavailable",
-                str(exc),
+                "模型提供方不可用，请检查模型配置和网络",
                 status=503,
                 details={"type": type(exc).__name__},
             ) from exc
@@ -131,12 +138,21 @@ class DirectionModelGateway:
                 'Return exactly {"ok":true}.',
                 schema,
             )
+        except ProductionError as exc:
+            if exc.code == "operation_cancelled":
+                raise
+            raise ProductionError(
+                "model_connection_failed",
+                "模型连接测试失败，请检查模型配置和网络",
+                status=502,
+                details={"type": type(exc).__name__},
+            ) from exc
         except Exception as exc:
             raise ProductionError(
-                str(getattr(exc, "code", "model_connection_failed")),
-                str(exc),
+                "model_connection_failed",
+                "模型连接测试失败，请检查模型配置和网络",
                 status=502,
-                details={"model": str(getattr(exc, "model", "") or "")},
+                details={"type": type(exc).__name__},
             ) from exc
         return {
             "ok": True,

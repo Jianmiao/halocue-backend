@@ -31,13 +31,13 @@ def api(settings):
         thread.join(timeout=2)
 
 
-def request(base: str, path: str, payload=None, method="GET"):
+def request(base: str, path: str, payload=None, method="GET", headers=None):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
         base + path,
         data=body,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -98,6 +98,19 @@ def test_http_exposes_formal_production_adapter_capabilities(settings):
     assert "token" not in public.casefold()
 
 
+def test_http_does_not_expose_direct_unversioned_adapter_operation_route(settings):
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/production-adapters/aa-compat/compile",
+            {},
+            "POST",
+        )
+
+    assert status == 404
+    assert result["error"]["code"] == "route_not_found"
+
+
 def test_http_maps_formal_request_version_error_to_stable_api_error(settings):
     with api(settings) as base:
         status, _, result = request(
@@ -114,6 +127,29 @@ def test_http_maps_formal_request_version_error_to_stable_api_error(settings):
     assert result["error"]["details"]["received"] == "2.0"
     assert "supported" in result["error"]["details"]
     assert "data_dir" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_http_negotiates_formal_api_error_v1_without_legacy_details(settings):
+    body = {
+        "schema_version": "2.0",
+        "private_path": "C:/Users/creator/private.json",
+        "api_key": "negotiated-secret",
+    }
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/production-runs",
+            body,
+            "POST",
+            {"Accept": "application/vnd.halocue.api-error+json; version=1.0"},
+        )
+
+    validate_contract("ApiError", result)
+    assert status == 400
+    assert result["code"] == "UNSUPPORTED_PRODUCTION_REQUEST_VERSION"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "private_path" not in serialized
+    assert "negotiated-secret" not in serialized
 
 
 def test_http_vertical_slice_and_error_contract(settings):
@@ -648,6 +684,37 @@ def test_http_direction_model_settings_are_redacted(settings, monkeypatch):
         assert status == 200
         assert loaded == saved
         assert "api_key" not in loaded["model"]
+
+
+def test_http_fetch_models_error_redacts_secret_and_private_exception(settings, monkeypatch):
+    original_urlopen = urllib.request.urlopen
+
+    def fail(_request, timeout):
+        if getattr(_request, "full_url", "").startswith("https://example.invalid/"):
+            raise RuntimeError(
+                "fetch failed with http-fetch-secret at C:/Users/creator/model-response.json"
+            )
+        return original_urlopen(_request, timeout=timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/settings/direction-model/fetch-models",
+            {
+                "provider": "openai",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "http-fetch-secret",
+            },
+            "POST",
+        )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert status == 502
+    assert result["error"]["code"] == "fetch_models_failed"
+    assert "http-fetch-secret" not in serialized
+    assert "model-response.json" not in serialized
+    assert result["error"]["details"] == {"type": "RuntimeError"}
 
 
 def test_http_file_source_and_aa_environment_routes(settings, tmp_path):

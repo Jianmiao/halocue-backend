@@ -290,6 +290,36 @@ def test_runtime_store_rejects_corrupt_database(tmp_path):
     assert raised.value.status == 500
 
 
+def test_runtime_store_maps_query_errors_after_database_corruption(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    runtime = RuntimeStore(path)
+    path.write_bytes(b"this is not a sqlite database")
+
+    for operation in (
+        runtime.schema_version,
+        lambda: runtime.resolve_production_run_id("run-000000000001"),
+        lambda: runtime.get_attempt("job-000000000001"),
+    ):
+        with pytest.raises(ProductionError) as raised:
+            operation()
+        assert raised.value.code == "runtime_database_corrupt"
+        assert raised.value.status == 500
+
+
+def test_runtime_store_reports_interrupted_migration_without_raw_sqlite_error(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    RuntimeStore(path, target_version=1)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version=0")
+
+    with pytest.raises(ProductionError) as raised:
+        RuntimeStore(path)
+
+    assert raised.value.code == "runtime_database_migration_failed"
+    assert raised.value.status == 500
+    assert raised.value.details == {"version": 1}
+
+
 def test_repository_imports_legacy_run_json_once(tmp_path):
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()

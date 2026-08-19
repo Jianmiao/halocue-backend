@@ -422,6 +422,15 @@ class RuntimeStore:
             status=500,
         )
 
+    @staticmethod
+    def _migration_error(version: int, exc: Exception) -> ProductionError:
+        return ProductionError(
+            "runtime_database_migration_failed",
+            "制作运行数据库升级失败，请从备份恢复或联系支持",
+            status=500,
+            details={"version": int(version)},
+        )
+
     def _connect(self) -> sqlite3.Connection:
         try:
             connection = sqlite3.connect(self.path, timeout=5)
@@ -429,7 +438,7 @@ class RuntimeStore:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=5000")
             return connection
-        except sqlite3.DatabaseError as exc:
+        except (sqlite3.DatabaseError, OSError) as exc:
             raise self._database_error(exc) from exc
 
     @contextmanager
@@ -465,8 +474,8 @@ class RuntimeStore:
                         },
                     )
                 for version in range(current + 1, target_version + 1):
-                    connection.execute("BEGIN IMMEDIATE")
                     try:
+                        connection.execute("BEGIN IMMEDIATE")
                         for statement in _MIGRATIONS[version]:
                             connection.execute(statement)
                         connection.execute(
@@ -475,9 +484,12 @@ class RuntimeStore:
                         )
                         connection.execute(f"PRAGMA user_version={version}")
                         connection.commit()
-                    except Exception:
+                    except ProductionError:
                         connection.rollback()
                         raise
+                    except Exception as exc:
+                        connection.rollback()
+                        raise self._migration_error(version, exc) from exc
             except sqlite3.DatabaseError as exc:
                 raise self._database_error(exc) from exc
             finally:
@@ -512,6 +524,8 @@ class RuntimeStore:
         connection = self._connect()
         try:
             return int(connection.execute("PRAGMA user_version").fetchone()[0])
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
         finally:
             connection.close()
 
@@ -2010,6 +2024,8 @@ class RuntimeStore:
                 (legacy_run_id,),
             ).fetchone()
             return str(row["id"]) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
         finally:
             connection.close()
 
@@ -2312,6 +2328,8 @@ class RuntimeStore:
                 and row["status"] == "running"
                 and not int(row["cancellation_requested"])
             )
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
         finally:
             connection.close()
 
@@ -2411,6 +2429,8 @@ class RuntimeStore:
                 "SELECT * FROM job_attempts WHERE job_id=?", (job_id,)
             ).fetchone()
             return self._attempt_payload(row) if row else None
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
         finally:
             connection.close()
 
@@ -2421,6 +2441,8 @@ class RuntimeStore:
                 "SELECT * FROM job_attempts ORDER BY updated_at DESC, id DESC"
             ).fetchall()
             return [self._attempt_payload(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
         finally:
             connection.close()
 
@@ -2466,5 +2488,7 @@ class RuntimeStore:
                 }
                 for row in rows
             ]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
         finally:
             connection.close()

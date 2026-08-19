@@ -14,6 +14,21 @@ from .errors import ProductionError
 
 PROVIDERS = {"openai", "anthropic"}
 
+_PUBLIC_SETTING_FIELDS = frozenset(
+    {
+        "provider",
+        "base_url",
+        "model",
+        "api_key_env",
+        "max_tokens",
+        "annotation_max_tokens",
+        "timeout",
+        "wall_timeout",
+        "reasoning_mode",
+        "reasoning_wire_protocol",
+    }
+)
+
 VENDOR_PRESETS: list[dict[str, Any]] = [
     {
         "id": "deepseek",
@@ -226,7 +241,16 @@ class DirectionModelSettings:
             raise ProductionError(
                 "model_settings_corrupted", "演出模型设置损坏", status=500
             ) from exc
-        return value if isinstance(value, dict) else {}
+        if not isinstance(value, dict):
+            return {}
+        # Treat the on-disk file as untrusted input.  Only the validated,
+        # non-secret connection settings may cross into public responses or
+        # provider construction.
+        return {
+            str(key): value[key]
+            for key in _PUBLIC_SETTING_FIELDS
+            if key in value
+        }
 
     @staticmethod
     def _validated(payload: dict[str, Any]) -> dict[str, Any]:
@@ -364,9 +388,9 @@ class DirectionModelSettings:
         except Exception as exc:
             raise ProductionError(
                 "fetch_models_failed",
-                f"获取模型列表失败: {exc}",
+                "获取模型列表失败，请检查模型地址和网络",
                 status=502,
-                details={"endpoint": models_endpoint, "error": str(exc)},
+                details={"type": type(exc).__name__},
             ) from exc
 
 

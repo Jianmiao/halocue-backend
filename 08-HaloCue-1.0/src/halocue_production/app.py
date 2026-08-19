@@ -76,6 +76,12 @@ class ProductionHandler(BaseHTTPRequestHandler):
         self._headers(status, len(body))
         self.wfile.write(body)
 
+    def _wants_api_error_v1(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "application/vnd.halocue.api-error+json" in accept and (
+            "version=1.0" in accept or "version=\"1.0\"" in accept
+        )
+
     def _send_asset(self, path: Path) -> None:
         if not path.is_file() or not path.is_relative_to(self.ui_root):
             raise ProductionError("route_not_found", "页面资源不存在", status=404)
@@ -344,13 +350,21 @@ class ProductionHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self._dispatch(method)
         except ProductionError as exc:
-            self._send(exc.status, exc.to_payload())
+            self._send(
+                exc.status,
+                exc.to_api_error_payload()
+                if self._wants_api_error_v1()
+                else exc.to_payload(),
+            )
         except Exception as exc:
+            error = ProductionError(
+                "internal_error", "服务器处理失败", status=500, details={"type": type(exc).__name__}
+            )
             self._send(
                 500,
-                ProductionError(
-                    "internal_error", "服务器处理失败", status=500, details={"type": type(exc).__name__}
-                ).to_payload(),
+                error.to_api_error_payload()
+                if self._wants_api_error_v1()
+                else error.to_payload(),
             )
         else:
             self._send(status, payload)
