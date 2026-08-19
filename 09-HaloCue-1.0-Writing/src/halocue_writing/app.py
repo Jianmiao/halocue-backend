@@ -27,9 +27,9 @@ class WritingRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'")
         self.end_headers()
 
-    def _json(self, value, status=200):
+    def _json(self, value, status=200, *, content_type="application/json; charset=utf-8"):
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        self._headers(status, "application/json; charset=utf-8", len(body))
+        self._headers(status, content_type, len(body))
         self.wfile.write(body)
 
     def _bytes(self, body: bytes, content_type: str, status: int = 200):
@@ -37,7 +37,14 @@ class WritingRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        length = int(self.headers.get("Content-Length", "0"))
+        if self.headers.get("Transfer-Encoding"):
+            raise DomainError("unsupported_transfer_encoding", "当前服务只接受带 Content-Length 的请求。")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise DomainError("invalid_content_length", "请求长度无效。") from exc
+        if length < 0:
+            raise DomainError("invalid_content_length", "请求长度无效。")
         if length > 8_000_000:
             raise DomainError("payload_too_large", "请求内容过大。", status=413)
         raw = self.rfile.read(length) if length else b"{}"
@@ -45,6 +52,12 @@ class WritingRequestHandler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise DomainError("invalid_json", "请求不是有效 JSON。") from exc
+
+    def _wants_api_error_v1(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "application/vnd.halocue.api-error+json" in accept and (
+            "version=1.0" in accept or 'version="1.0"' in accept
+        )
 
     def _parts(self):
         return [item for item in urlparse(self.path).path.split("/") if item]
@@ -187,7 +200,14 @@ class WritingRequestHandler(BaseHTTPRequestHandler):
             self._error(DomainError("internal_error", "写作服务发生内部错误。", status=500, details={"type": type(exc).__name__}))
 
     def _error(self, exc: DomainError):
-        self._json({"ok": False, "error": {"code": exc.code, "message": exc.message, "details": exc.details}}, exc.status)
+        if self._wants_api_error_v1():
+            self._json(
+                exc.to_api_error_payload(),
+                exc.status,
+                content_type="application/vnd.halocue.api-error+json; version=1.0",
+            )
+            return
+        self._json(exc.to_payload(), exc.status)
 
     def _static(self, path: str):
         relative = "index.html" if path in ("", "/") else path.lstrip("/")

@@ -1,17 +1,24 @@
 import json
+import sqlite3
 import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 from halocue_writing.app import make_handler
+from halocue_writing.errors import DomainError
+from halocue_writing.repository import Repository
 from halocue_writing.service import WritingService
 
 
-def request(url, method="GET", body=None):
+def request(url, method="GET", body=None, headers=None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    request_headers = {"Content-Type": "application/json"}
+    request_headers.update(headers or {})
+    req = urllib.request.Request(url, data=data, method=method, headers=request_headers)
     try:
         with urllib.request.urlopen(req) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
@@ -62,6 +69,18 @@ def test_http_contract_and_static_workspace(tmp_path):
                 "details": {"expected_version": 0, "actual_version": 1},
             },
         }
+        status, negotiated = request(
+            base + f"/api/v1/works/{work['id']}/brief",
+            "POST",
+            {"expected_version": 0, "idea": "过期请求", "mode": "bond_short"},
+            headers={
+                "Accept": "application/vnd.halocue.api-error+json; version=1.0"
+            },
+        )
+        assert status == 409
+        assert negotiated["schema_version"] == "1.0"
+        assert negotiated["code"] == "REVISION_CONFLICT"
+        assert "ok" not in negotiated
         status, bad_search = request(base + "/api/v1/official-references/search?q=x")
         assert status == 400
         assert bad_search["error"]["code"] == "validation_error"
@@ -69,3 +88,31 @@ def test_http_contract_and_static_workspace(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_writing_schema_version_migration_restart_and_corruption(tmp_path):
+    data_dir = tmp_path / "writing"
+    repository = Repository(data_dir)
+    assert repository.schema_version() == 2
+    with sqlite3.connect(repository.db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT version FROM writing_schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,)]
+        connection.execute("PRAGMA user_version = 1")
+
+    restarted = Repository(data_dir)
+    assert restarted.schema_version() == 2
+
+    with sqlite3.connect(restarted.db_path) as connection:
+        connection.execute("PRAGMA user_version = 99")
+    with pytest.raises(DomainError) as unsupported:
+        Repository(data_dir)
+    assert unsupported.value.code == "writing_database_version_unsupported"
+
+    corrupt_path = tmp_path / "corrupt" / "writing.db"
+    corrupt_path.parent.mkdir()
+    corrupt_path.write_bytes(b"not a sqlite database")
+    with pytest.raises(DomainError) as corrupt:
+        Repository(corrupt_path.parent)
+    assert corrupt.value.code == "writing_database_corrupt"
