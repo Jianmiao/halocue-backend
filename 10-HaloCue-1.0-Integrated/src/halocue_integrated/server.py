@@ -39,10 +39,28 @@ class IntegratedRuntime:
         self.production_server = create_production_server(self.production_service, "127.0.0.1", 0)
         production_address = ("127.0.0.1", self.production_server.server_port)
 
+        def publish_formal_artifact(
+            uri: str,
+            content: bytes,
+            *,
+            kind: str,
+            media_type: str,
+            metadata: dict[str, object],
+        ):
+            """Bridge immutable writing bytes into the shared local ArtifactStore."""
+            return self.production_service.artifacts.commit_bytes(
+                uri,
+                content,
+                kind=kind,
+                media_type=media_type,
+                metadata=metadata,
+            )
+
         self.writing_service = WritingService(
             writing_data_dir,
             f"http://127.0.0.1:{self.production_server.server_port}",
             public_production_url="/production",
+            formal_artifact_publisher=publish_formal_artifact,
         )
         writing_handler = make_handler(self.writing_service, WRITING_ROOT / "web")
         self.writing_server = ThreadingHTTPServer(("127.0.0.1", 0), writing_handler)

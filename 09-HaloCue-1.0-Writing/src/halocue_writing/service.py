@@ -7,14 +7,16 @@ import json
 import os
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
+from typing import Any, Callable
 
 from .errors import DomainError, NotFound, RevisionConflict
 from .ba_world_starter import BA_WORLD_STARTER_SOURCE, BA_WORLD_STARTER_VERSION, starter_bible
 from .model_settings import UserPreferencesStore, WritingModelSettings
 from .official_reference_catalog import OfficialReferenceCatalog
 from .providers import FakeWritingProvider, make_writing_provider
-from .repository import Repository, canonical_json, new_id, now, sha256_text
+from .repository import Repository, canonical_json, new_id, now, sha256_bytes, sha256_text
 from .workflow_pack import COMMON_RULES, MODE_SOURCES, PACK_VERSION, describe_pack, template_contract
 
 
@@ -28,6 +30,7 @@ class WritingService:
         production_url: str = "http://127.0.0.1:8892",
         official_corpus_dir: Path | None = None,
         public_production_url: str | None = None,
+        formal_artifact_publisher: Callable[..., Any] | None = None,
     ):
         self.repo = Repository(data_dir)
         self.model_settings = WritingModelSettings(data_dir)
@@ -37,6 +40,10 @@ class WritingService:
         self.public_production_url = (
             (public_production_url or self.production_url).rstrip("/")
         )
+        # The integrated composition root injects the production ArtifactStore
+        # here.  The writing domain never receives a physical path or owns the
+        # production database; it only publishes immutable bytes by stable URI.
+        self.formal_artifact_publisher = formal_artifact_publisher
         configured_corpus = official_corpus_dir or os.environ.get("HALOCUE_BA_CORPUS_DIR")
         if configured_corpus:
             corpus_dir = Path(configured_corpus)
@@ -63,6 +70,7 @@ class WritingService:
                 "proposal_diff",
                 "script_release",
                 "production_handoff",
+                "formal_production_handoff" if self.formal_artifact_publisher else "compatibility_production_handoff",
                 "work_canon",
                 "character_cards",
                 "world_bible",
@@ -2955,7 +2963,239 @@ class WritingService:
             self._bump_work(connection, work_id, version)
         return {"release_id": release_id, "manifest": manifest, "work": self.get_work(work_id)}
 
+    @staticmethod
+    def _formal_uuid(kind: str, value: str) -> str:
+        """Stable UUID projection for legacy writing IDs at the formal boundary."""
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"halocue:writing:{kind}:{value}"))
+
+    def _formal_canon_revision_id(self, connection, work_id: str, release_id: str) -> str:
+        row = connection.execute(
+            """
+            SELECT r.id
+            FROM artifacts a
+            JOIN revisions r ON r.id=a.current_revision_id
+            WHERE a.work_id=? AND a.kind='work_canon' AND a.current_revision_id IS NOT NULL
+            LIMIT 1
+            """,
+            (work_id,),
+        ).fetchone()
+        if row:
+            return self._formal_uuid("revision", str(row["id"]))
+        # Older workspaces may not have a canon artifact yet.  Keep the formal
+        # contract valid with a deterministic boundary projection; the source
+        # scene revisions remain the authoritative release inputs.
+        return self._formal_uuid("canon-snapshot", release_id)
+
+    def _formal_handoff_release(self, release_id: str):
+        if self.formal_artifact_publisher is None:
+            raise DomainError(
+                "formal_handoff_unavailable",
+                "当前写作服务未连接共享工作区，无法提交正式制作请求。",
+                status=503,
+            )
+        with self.repo.connect() as connection:
+            release = connection.execute(
+                "SELECT * FROM script_releases WHERE id=?", (release_id,)
+            ).fetchone()
+            if not release:
+                raise NotFound("script_release", release_id)
+            release = dict(release)
+            work = connection.execute(
+                "SELECT title FROM works WHERE id=?", (release["work_id"],)
+            ).fetchone()
+            source_revision_ids = json.loads(release["source_revision_ids_json"])
+            gate_snapshot_ids = json.loads(release["gate_snapshot_ids_json"])
+            canon_revision_id = self._formal_canon_revision_id(
+                connection, release["work_id"], release_id
+            )
+
+        formal_release_id = self._formal_uuid("release", release_id)
+        request_id = self._formal_uuid("production-request", release_id)
+        if release["production_run_id"]:
+            return {
+                "release_id": release_id,
+                "production_run_id": release["production_run_id"],
+                "idempotent": True,
+                "contract": "ProductionRequest/1.1",
+                "formal_release_id": formal_release_id,
+                "production_request_id": request_id,
+            }
+
+        formal_work_id = self._formal_uuid("work", release["work_id"])
+        formal_manifest_uri = (
+            f"workspace://releases/{formal_release_id}/manifest.json"
+        )
+        formal_content_uri = f"workspace://releases/{formal_release_id}/script.txt"
+        formal_source_ids = [
+            self._formal_uuid("revision", str(item)) for item in source_revision_ids
+        ]
+        formal_gate_ids = [
+            self._formal_uuid("gate", str(item)) for item in gate_snapshot_ids
+        ]
+        formal_release = {
+            "schema_version": "1.1",
+            "id": formal_release_id,
+            "work_id": formal_work_id,
+            "display_version": release["display_version"],
+            "manifest_uri": formal_manifest_uri,
+            "content_uri": formal_content_uri,
+            "content_hash": release["content_hash"],
+            "canon_revision_id": canon_revision_id,
+            "writing_pack_version": release["writing_pack_version"],
+            "source_revision_ids": formal_source_ids,
+            "gate_snapshot_ids": formal_gate_ids,
+            "released_by": release["released_by"],
+            "released_at": release["released_at"],
+        }
+        content = self.repo.read_text(release["content_uri"]).encode("utf-8")
+        if sha256_bytes(content) != release["content_hash"]:
+            raise DomainError(
+                "script_release_hash_mismatch",
+                "写作发布正文与冻结哈希不一致，已拒绝正式交接。",
+                status=409,
+            )
+        release_bytes = canonical_json(formal_release).encode("utf-8") + b"\n"
+        asset_manifest_id = self._formal_uuid("asset-manifest", release_id)
+        asset_manifest_uri = f"workspace://assets/{asset_manifest_id}/manifest.json"
+        asset_manifest = {
+            "schema_version": "1.0",
+            "id": asset_manifest_id,
+            "content_hash": "",
+            "created_at": release["released_at"],
+            "assets": [],
+        }
+        asset_manifest["content_hash"] = sha256_text(
+            canonical_json(
+                {
+                    key: value
+                    for key, value in asset_manifest.items()
+                    if key != "content_hash"
+                }
+            )
+        )
+        asset_manifest_bytes = canonical_json(asset_manifest).encode("utf-8") + b"\n"
+
+        publish = self.formal_artifact_publisher
+        for uri, body, kind, media_type in (
+            (formal_content_uri, content, "script-release-content", "text/plain"),
+            (formal_manifest_uri, release_bytes, "script-release-manifest", "application/json"),
+            (asset_manifest_uri, asset_manifest_bytes, "asset-manifest", "application/json"),
+        ):
+            try:
+                publish(
+                    uri,
+                    body,
+                    kind=kind,
+                    media_type=media_type,
+                    metadata={
+                        "contract": "ScriptRelease/1.1"
+                        if kind.startswith("script-release")
+                        else "AssetManifest/1.0",
+                        "release_id": formal_release_id,
+                    },
+                )
+            except Exception as exc:
+                raise DomainError(
+                    "formal_artifact_publish_failed",
+                    "正式发布产物无法登记到制作工作区。",
+                    status=503,
+                    details={"kind": kind, "type": type(exc).__name__},
+                ) from exc
+
+        request = {
+            "schema_version": "1.1",
+            "request_id": request_id,
+            "production_display_name": f"{work['title']} · {release['display_version']}",
+            "script_release": {
+                "version": "1.1",
+                "id": formal_release_id,
+                "display_version": release["display_version"],
+                "content_hash": release["content_hash"],
+                "manifest_uri": formal_manifest_uri,
+                "content_uri": formal_content_uri,
+            },
+            "script_manifest_version": "1.1",
+            "asset_manifest": {
+                "id": asset_manifest_id,
+                "version": "1.0",
+                "content_hash": asset_manifest["content_hash"],
+                "uri": asset_manifest_uri,
+            },
+            "production_policy": {
+                "asset_reference_mode": "whitelist_only",
+                "allow_placeholders": False,
+                "target": "pc_aap",
+            },
+            "idempotency_key": "",
+        }
+        request["idempotency_key"] = sha256_text(
+            canonical_json({key: value for key, value in request.items() if key != "idempotency_key"})
+        )
+        body = canonical_json(request).encode("utf-8")
+        http_request = urllib.request.Request(
+            self.production_url + "/api/v1/production-runs",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                http_request, timeout=PRODUCTION_HANDOFF_TIMEOUT_SECONDS
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                upstream = json.loads(exc.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                upstream = {}
+            error = upstream.get("error", {})
+            raise DomainError(
+                str(error.get("code") or "production_rejected"),
+                str(error.get("message") or "制作后端拒绝了这份正式发布版本。"),
+                status=exc.code,
+                details={
+                    "upstream_code": str(error.get("code") or "production_rejected"),
+                    "url": self.public_production_url,
+                },
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise DomainError(
+                "production_unavailable",
+                "制作后端当前不可用，正式发布版本仍安全保留。",
+                status=503,
+                details={"url": self.public_production_url},
+            ) from exc
+        run_id = (
+            result.get("run", {}).get("run_id")
+            or result.get("run_id")
+            or result.get("id")
+            or result.get("production_run", {}).get("id")
+        )
+        if not run_id:
+            raise DomainError(
+                "production_contract_error",
+                "制作后端未返回 ProductionRun ID。",
+                status=502,
+                details={"response_keys": sorted(result) if isinstance(result, dict) else []},
+            )
+        with self.repo.transaction() as connection:
+            connection.execute(
+                "UPDATE script_releases SET production_run_id=? WHERE id=?",
+                (run_id, release_id),
+            )
+        return {
+            "release_id": release_id,
+            "formal_release_id": formal_release_id,
+            "production_request_id": request_id,
+            "production_run_id": run_id,
+            "contract": "ProductionRequest/1.1",
+            "idempotent": bool(result.get("handoff", {}).get("idempotent", False)),
+            "response": result,
+        }
+
     def handoff_release(self, release_id: str):
+        if self.formal_artifact_publisher is not None:
+            return self._formal_handoff_release(release_id)
         with self.repo.connect() as connection:
             release = connection.execute("SELECT * FROM script_releases WHERE id=?", (release_id,)).fetchone()
             if not release:
