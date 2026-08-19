@@ -173,6 +173,7 @@ class BuildBundleAssembler:
         draft_ref: DraftRef,
         legacy_result: Mapping[str, Any],
         producer: Mapping[str, str],
+        cancelled: Callable[[], bool] | None = None,
     ) -> BuildBundleRef:
         raw_path = legacy_result.get("aap_path")
         if raw_path is None:
@@ -184,6 +185,7 @@ class BuildBundleAssembler:
         source = Path(str(raw_path))
         file_hash = self._hash_source(source)
         artifact_id = str(uuid.uuid5(_DELIVERABLE_NAMESPACE, f"aap:{file_hash}"))
+        cancellation_probe = cancelled or request.is_cancelled
         return self.assemble(
             request_id=request.request_id,
             performance_draft_id=draft_ref.draft_id,
@@ -209,7 +211,7 @@ class BuildBundleAssembler:
             run_id=request.run_id,
             work_item_id=request.work_item_id,
             attempt_id=request.attempt_id,
-            cancelled=lambda: request.cancelled,
+            cancelled=cancellation_probe,
         )
 
     def _register_deliverable(

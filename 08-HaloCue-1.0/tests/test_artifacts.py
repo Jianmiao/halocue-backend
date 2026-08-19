@@ -71,6 +71,58 @@ def test_publish_artifact_reuses_registered_workspace_bytes_and_is_restart_safe(
     assert restarted.get_artifact(published.uri).content_hash == workspace.content_hash
 
 
+def test_publish_artifact_rejects_abandoned_attempt_result(tmp_path):
+    store, runtime = artifact_store(tmp_path)
+    payload = {
+        "run_id": "run-000000000001",
+        "project": "artifact-attempt-test",
+        "release_id": "release-000000000001",
+        "draft_token": None,
+        "state": "waiting_for_review",
+        "current_stage": "review_install",
+        "created_at": "2026-08-15T00:00:00+00:00",
+        "updated_at": "2026-08-15T00:01:00+00:00",
+        "work_items": [
+            {
+                "key": "compile",
+                "label": "compile",
+                "state": "pending",
+                "progress": 0,
+                "detail": "waiting",
+            }
+        ],
+        "source_summary": {"line_count": 1},
+    }
+    _, work_items = runtime.save_production_run(payload)
+    created = runtime.create_attempt(
+        job_id="job-000000000001",
+        kind="adapter_render",
+        legacy_run_id=payload["run_id"],
+        work_item_id=work_items["compile"],
+        retry_context={},
+    )
+    assert runtime.start_attempt(created["attempt_id"]) is True
+    assert runtime.abandon_active_attempts() == [created["job_id"]]
+
+    workspace = store.commit_bytes(
+        "workspace://late-results/preview.json",
+        b"late result",
+        kind="preview",
+        media_type="application/json",
+    )
+    with pytest.raises(ProductionError) as raised:
+        store.publish_artifact(
+            "late-results",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            workspace,
+            provenance={"attempt_id": created["attempt_id"]},
+        )
+
+    assert raised.value.code == "attempt_result_rejected"
+    assert raised.value.status == 409
+    assert runtime.list_artifact_refs_for_attempt(created["attempt_id"]) == []
+
+
 def test_publish_artifact_rejects_conflicting_alias_and_unregistered_workspace(tmp_path):
     store, _ = artifact_store(tmp_path)
     workspace = store.commit_bytes(

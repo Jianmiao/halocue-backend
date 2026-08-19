@@ -82,6 +82,42 @@ class BlockingAdapter(AdapterBase):
         return AdapterResult(cancelled=True)
 
 
+class LatePublishingAdapter(BlockingAdapter):
+    adapter_id = "storyforge-local"
+
+    def __init__(self, artifacts):
+        super().__init__()
+        self.artifacts = artifacts
+        self.finished = threading.Event()
+        self.published_uri = None
+
+    def capabilities(self):
+        value = super().capabilities()
+        value["adapter_id"] = self.adapter_id
+        return value
+
+    def render(self, request, draft_ref, options=None):
+        self.started.set()
+        self.release.wait(timeout=3)
+        try:
+            workspace = self.artifacts.commit_bytes(
+                f"workspace://late-results/{request.attempt_id}.json",
+                b"late adapter result",
+                kind="preview",
+                media_type="application/json",
+            )
+            artifact = self.artifacts.publish_artifact(
+                "late-results",
+                request.attempt_id,
+                workspace,
+                provenance={"attempt_id": request.attempt_id},
+            )
+            self.published_uri = artifact.uri
+            return AdapterResult(artifact_refs=(artifact.uri,))
+        finally:
+            self.finished.set()
+
+
 def _formal_context(service: ProductionService):
     request = json.loads(
         (EXAMPLE_DIR / "production-request-1.1.json").read_text(encoding="utf-8")
@@ -115,6 +151,21 @@ def _formal_context(service: ProductionService):
             "utf-8"
         ),
         kind="asset-manifest",
+        media_type="application/json",
+    )
+    release = json.loads(
+        (EXAMPLE_DIR / "script-release-1.1.json").read_text(encoding="utf-8")
+    )
+    release["id"] = request["script_release"]["id"]
+    release["manifest_uri"] = request["script_release"]["manifest_uri"]
+    release["content_uri"] = request["script_release"]["content_uri"]
+    release["content_hash"] = request["script_release"]["content_hash"]
+    service.artifacts.commit_bytes(
+        release["manifest_uri"],
+        json.dumps(release, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        ),
+        kind="script-release-manifest",
         media_type="application/json",
     )
     adapter_request = AdapterRequest(request, asset_manifest=manifest)
@@ -190,3 +241,55 @@ def test_cancelled_adapter_job_discards_late_result(settings):
     assert job is not None and job.state == "cancelled"
     assert job.result is None
     service.jobs.close()
+
+
+def test_restart_abandons_adapter_attempt_and_retry_isolated_from_late_result(settings):
+    service = ProductionService(settings)
+    request, draft = _formal_context(service)
+    service.create_run(request.to_payload())
+    late = LatePublishingAdapter(service.artifacts)
+    service.production_adapters = AdapterRegistry([late])
+
+    status, submitted = service.submit_adapter_operation(
+        request,
+        draft,
+        operation="render",
+        options={"target": "storyforge_preview"},
+    )
+    assert status == 202
+    old_job = submitted["job"]
+    old_attempt_id = old_job["attempt_id"]
+    assert late.started.wait(timeout=2)
+
+    service.jobs.close()
+    abandoned = service.jobs.get(old_job["job_id"])
+    assert abandoned is not None
+    assert abandoned.state == "abandoned"
+
+    late.release.set()
+    assert late.finished.wait(timeout=3)
+    assert service.repository.runtime.list_artifact_refs_for_attempt(old_attempt_id) == []
+    assert late.published_uri is None
+
+    restored = ProductionService(settings)
+    try:
+        retry = restored.retry_job(old_job["job_id"])
+        assert retry["job"]["attempt_id"] != old_attempt_id
+        retried = _wait_for(restored, retry["job"]["job_id"], "succeeded")
+        assert retried is not None
+        assert retried.state == "succeeded"
+        assert set(retried.retry_context) == {
+            "request_id",
+            "adapter_id",
+            "target",
+            "draft_revision_id",
+            "input_hashes",
+        }
+        assert retried.result is not None
+        assert retried.result.get("bundle_ref") is not None
+        assert restored.repository.runtime.list_artifact_refs_for_attempt(
+            retried.attempt_id
+        )
+        assert restored.jobs.get(old_job["job_id"]).state == "abandoned"
+    finally:
+        restored.jobs.close()

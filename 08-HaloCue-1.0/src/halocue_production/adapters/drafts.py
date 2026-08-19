@@ -67,7 +67,7 @@ class PerformanceDraftStore:
     def create_imported(
         self, request: AdapterRequest, adapter_id: str
     ) -> DraftRef:
-        if request.cancelled:
+        if request.is_cancelled():
             raise ProductionError(
                 "adapter_request_cancelled",
                 "已取消的适配器请求不能创建 PerformanceDraft",

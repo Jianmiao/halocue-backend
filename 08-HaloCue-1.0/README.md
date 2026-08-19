@@ -64,6 +64,11 @@ On startup, attempts left in `queued` or `running` are marked `abandoned`.
 Retry is always explicit and creates a new attempt for the same work item.
 Cancellation is persisted before it is acknowledged, and late model or compile
 results cannot update the associated run or become the accepted job result.
+Artifact publication is also guarded by the persistent Attempt state: an
+abandoned, cancelled, or missing Attempt cannot register an `artifact://`
+reference or a `BuildBundle`. Adapter retries reuse only the persisted request,
+adapter, target, draft revision, and input hashes; they never reuse the old
+Attempt identity.
 Model providers with streaming support check cancellation while receiving
 chunks. AA compilation runs in a HaloCue-owned child process with a minimal
 environment; cancellation terminates that process and removes the cancelled

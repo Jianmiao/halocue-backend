@@ -22,6 +22,7 @@ class BundlePublisher(Protocol):
         draft_ref: DraftRef,
         legacy_result: Mapping[str, Any],
         producer: Mapping[str, str],
+        cancelled: Callable[[], bool] | None = None,
     ) -> BuildBundleRef: ...
 
 
@@ -142,9 +143,7 @@ class AzureArchiveAdapter(AdapterBase):
         draft_ref: DraftRef,
     ) -> AdapterResult:
         self.require_capability("compile_aap", target=request.target)
-        if request.cancelled or (
-            request.attempt_id and request.attempt_id in self._cancelled_attempts
-        ):
+        if self._is_cancelled(request):
             raise ProductionError(
                 "adapter_operation_cancelled",
                 "AA 编译已取消",
@@ -175,14 +174,14 @@ class AzureArchiveAdapter(AdapterBase):
             build_id = str(self.legacy.create_compile_snapshot(token, version))
             with self._lock:
                 self._active_compiles[attempt] = (token, build_id)
-            if attempt in self._cancelled_attempts:
+            if self._is_cancelled(request):
                 raise ProductionError("operation_cancelled", "AA 编译已取消", status=409)
             legacy_result = self.legacy.execute_compile_cancellable(
                 token,
                 build_id,
-                cancellation_probe=lambda: attempt in self._cancelled_attempts,
+                cancellation_probe=lambda: self._is_cancelled(request),
             )
-            if attempt in self._cancelled_attempts:
+            if self._is_cancelled(request):
                 raise ProductionError("operation_cancelled", "AA 编译已取消", status=409)
             publisher = self.bundle_publisher
             if publisher is None:
@@ -205,6 +204,7 @@ class AzureArchiveAdapter(AdapterBase):
                     "engine_id": self.engine_id,
                     "engine_version": self.engine_version,
                 },
+                cancelled=lambda: self._is_cancelled(request),
             )
             if not isinstance(bundle, BuildBundleRef):
                 raise ProductionError(
@@ -253,6 +253,15 @@ class AzureArchiveAdapter(AdapterBase):
             except Exception as exc:
                 raise self._normalize_error(exc, "cancel") from exc
         return AdapterResult(cancelled=True)
+
+    def _is_cancelled(self, request: AdapterRequest) -> bool:
+        return bool(
+            request.is_cancelled()
+            or (
+                request.attempt_id
+                and request.attempt_id in self._cancelled_attempts
+            )
+        )
 
     def _load_draft(self, draft_ref: DraftRef) -> DraftRef:
         try:

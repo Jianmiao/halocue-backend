@@ -310,7 +310,13 @@ class StoryForgeAdapter(AdapterBase):
             )
 
     def _is_cancelled(self, request: AdapterRequest) -> bool:
-        return bool(request.cancelled or (request.attempt_id and request.attempt_id in self._cancelled_attempts))
+        return bool(
+            request.is_cancelled()
+            or (
+                request.attempt_id
+                and request.attempt_id in self._cancelled_attempts
+            )
+        )
 
     @staticmethod
     def _normalize_error(exc: Exception, operation: str) -> ProductionError:

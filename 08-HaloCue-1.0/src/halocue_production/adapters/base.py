@@ -4,7 +4,7 @@ import copy
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from ..contracts import ContractValidationError, validate_contract
@@ -90,6 +90,9 @@ class AdapterRequest:
     work_item_id: str | None
     attempt_id: str | None
     cancelled: bool
+    cancellation_probe: Callable[[], bool] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __init__(
         self,
@@ -103,6 +106,7 @@ class AdapterRequest:
         work_item_id: str | None = None,
         attempt_id: str | None = None,
         cancelled: bool = False,
+        cancellation_probe: Callable[[], bool] | None = None,
     ) -> None:
         if production_request is not None and request is not None:
             raise TypeError("provide production_request or request, not both")
@@ -155,6 +159,18 @@ class AdapterRequest:
             _uuid(attempt_id, "attempt_id") if attempt_id is not None else None,
         )
         object.__setattr__(self, "cancelled", bool(cancelled))
+        if cancellation_probe is not None and not callable(cancellation_probe):
+            raise TypeError("cancellation_probe must be callable")
+        object.__setattr__(self, "cancellation_probe", cancellation_probe)
+
+    def is_cancelled(self) -> bool:
+        return bool(
+            self.cancelled
+            or (
+                self.cancellation_probe is not None
+                and bool(self.cancellation_probe())
+            )
+        )
 
     @property
     def request_id(self) -> str:

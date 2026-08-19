@@ -2067,6 +2067,7 @@ class ProductionService:
                 run_id=request.run_id,
                 work_item_id=work_item_id or request.work_item_id,
                 attempt_id=token.attempt_id,
+                cancellation_probe=token.is_cancelled,
             )
             token.raise_if_cancelled()
             if operation == "compile":

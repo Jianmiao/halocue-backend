@@ -730,6 +730,31 @@ class RuntimeStore:
     ) -> dict[str, Any]:
         now = _now()
         with self._transaction() as connection:
+            if attempt_id is not None:
+                attempt = connection.execute(
+                    "SELECT status, cancellation_requested FROM job_attempts WHERE id=?",
+                    (attempt_id,),
+                ).fetchone()
+                if attempt is None:
+                    raise ProductionError(
+                        "attempt_result_rejected",
+                        "Artifact 来源 Attempt 不存在，已拒绝发布结果",
+                        status=409,
+                        details={"attempt_id": attempt_id},
+                    )
+                if (
+                    str(attempt["status"]) != "running"
+                    or bool(attempt["cancellation_requested"])
+                ):
+                    raise ProductionError(
+                        "attempt_result_rejected",
+                        "Artifact 来源 Attempt 已不可发布结果",
+                        status=409,
+                        details={
+                            "attempt_id": attempt_id,
+                            "state": str(attempt["status"]),
+                        },
+                    )
             workspace = connection.execute(
                 "SELECT content_hash FROM workspace_files WHERE uri=?",
                 (workspace_uri,),
