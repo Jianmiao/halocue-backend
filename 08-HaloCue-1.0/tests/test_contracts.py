@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from halocue_production.errors import ProductionError
+from halocue_production.contracts import validate_contract
 from halocue_production.jobs import JobRecord
 from halocue_production.service import ProductionService
 
@@ -152,6 +153,21 @@ def test_failed_job_public_contract_hides_private_exception_text(tmp_path):
     }
     assert private_path not in json.dumps(public, ensure_ascii=False)
     assert record.error["message"] == f"invalid output: {private_path}"
+
+
+def test_formal_api_error_view_redacts_credentials_and_paths():
+    payload = ProductionError(
+        "model_connection_failed",
+        "request failed api_key=secret-value at C:/Users/creator/model.json",
+        status=502,
+        details={"error": "secret-value", "path": "C:/Users/creator/model.json"},
+    ).to_api_error_payload()
+
+    validate_contract("ApiError", payload)
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "secret-value" not in serialized
+    assert "model.json" not in serialized
+    assert payload["retryability"] == "automatic"
 
 
 def test_aa_discovery_error_contract_hides_candidate_paths(settings, tmp_path, monkeypatch):

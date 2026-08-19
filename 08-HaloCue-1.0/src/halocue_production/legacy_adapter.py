@@ -375,7 +375,11 @@ class Legacy093Adapter:
         try:
             result = self._modules["asset_import"].validate_asset_request(request)
         except self._modules["asset_import"].AssetImportRequestError as exc:
-            raise ProductionError(getattr(exc, "code", "invalid_asset_request"), str(exc)) from exc
+            raise ProductionError(
+                getattr(exc, "code", "invalid_asset_request"),
+                "上传素材请求无法验证",
+                details={"type": type(exc).__name__},
+            ) from exc
         return {
             "ok": bool(result.get("ok")),
             "kind": kind,
@@ -600,6 +604,52 @@ class Legacy093Adapter:
 
     def list_task_assets(self, token: str) -> list[dict[str, Any]]:
         return [self.task_asset_public(item) for item in self._task_custom_assets(token)]
+
+    def task_asset_record(self, token: str, asset_id: str) -> tuple[dict[str, Any], Path]:
+        if not re.fullmatch(r"asset-[0-9a-f]{12}", str(asset_id)):
+            raise ProductionError("invalid_task_asset_id", "素材标识无效")
+        record = next(
+            (
+                item
+                for item in self._task_custom_assets(token)
+                if isinstance(item, dict) and item.get("asset_id") == asset_id
+            ),
+            None,
+        )
+        if record is None:
+            raise ProductionError(
+                "task_asset_not_found", "当前任务没有这条自定义素材", status=404
+            )
+        draft_dir = self.store.get_draft_path(token).resolve()
+        asset_root = (draft_dir / "custom-assets" / asset_id).resolve()
+        try:
+            asset_root.relative_to(draft_dir)
+        except ValueError as exc:
+            raise ProductionError(
+                "task_asset_corrupt", "任务素材存储位置无效", status=500
+            ) from exc
+        kind = str(record.get("kind") or "")
+        if kind == "character":
+            source = asset_root
+            valid = source.is_dir() and not source.is_symlink()
+        else:
+            try:
+                files = [
+                    item
+                    for item in asset_root.iterdir()
+                    if item.is_file() and not item.is_symlink()
+                ]
+            except OSError as exc:
+                raise ProductionError(
+                    "task_asset_corrupt", "任务素材内容无法读取", status=500
+                ) from exc
+            source = files[0] if len(files) == 1 else asset_root
+            valid = len(files) == 1
+        if not valid:
+            raise ProductionError(
+                "task_asset_corrupt", "任务素材内容不完整", status=500
+            )
+        return dict(record), source
 
     def remove_task_asset(
         self, *, token: str, asset_id: str, expected_draft_version: int
@@ -954,10 +1004,22 @@ class Legacy093Adapter:
         user = "请分析以下带行号的冻结剧本。行号仅用于定位，直接返回 JSON。\n\n" + numbered
         try:
             result = provider.complete_json(system, volatile, user, self._AI_PREFLIGHT_SCHEMA)
-        except ProductionError:
-            raise
+        except ProductionError as exc:
+            if exc.code == "operation_cancelled":
+                raise
+            raise ProductionError(
+                "ai_preflight_failed",
+                "AI 初审调用失败，请检查模型配置和网络",
+                status=502,
+                details={"type": type(exc).__name__},
+            ) from exc
         except Exception as exc:
-            raise ProductionError("ai_preflight_failed", str(exc), status=502) from exc
+            raise ProductionError(
+                "ai_preflight_failed",
+                "AI 初审调用失败，请检查模型配置和网络",
+                status=502,
+                details={"type": type(exc).__name__},
+            ) from exc
         analysis = self._validate_ai_preflight_result(result, line_count=len(lines))
         record = {
             "kind": "ai_preflight",
@@ -1679,7 +1741,9 @@ class Legacy093Adapter:
                 details=getattr(exc, "counts", {}),
             ) from exc
         except self._modules["build_bundle"].CompileInputStaleError as exc:
-            raise ProductionError("compile_input_stale", str(exc), status=409) from exc
+            raise ProductionError(
+                "compile_input_stale", "编译输入已变化，请重新提交编译", status=409
+            ) from exc
 
     def execute_compile(self, token: str, build_id: str) -> dict[str, Any]:
         with _COMPILE_LOCK:
@@ -1978,11 +2042,13 @@ class Legacy093Adapter:
                 story_name=story_name,
             )
         except self._modules["install_manager"].AARunningError as exc:
-            raise ProductionError("aa_running", str(exc), status=423) from exc
+            raise ProductionError("aa_running", "AA 正在运行，请先关闭后再安装", status=423) from exc
         except self._modules["install_manager"].AAInstallTargetExistsError as exc:
-            raise ProductionError("install_target_exists", str(exc), status=409) from exc
+            raise ProductionError(
+                "install_target_exists", "安装目标已存在，请更换分类或作品名", status=409
+            ) from exc
         except self._modules["install_manager"].AACorruptBundleError as exc:
-            raise ProductionError("corrupted_bundle", str(exc), status=400) from exc
+            raise ProductionError("corrupted_bundle", "AA 构建包损坏，无法安装", status=400) from exc
 
     def install_options(self, *, token: str, build_id: str) -> dict[str, Any]:
         if self.capabilities()["install"]["state"] != "available":
@@ -1999,7 +2065,7 @@ class Legacy093Adapter:
         try:
             result = manager.install_options(token=token, build_id=build_id)
         except self._modules["install_manager"].AACorruptBundleError as exc:
-            raise ProductionError("corrupted_bundle", str(exc), status=400) from exc
+            raise ProductionError("corrupted_bundle", "AA 构建包损坏，无法读取安装选项", status=400) from exc
         existing = result.get("existing_install")
         return {
             "ok": True,
@@ -2030,7 +2096,7 @@ class Legacy093Adapter:
                 options["source_project"] if story_name is None else story_name,
             )
         except ValueError as exc:
-            raise ProductionError("invalid_install_name", str(exc)) from exc
+            raise ProductionError("invalid_install_name", "安装分类或作品名无效") from exc
         aa_data = Path(str(self.settings.aa_data))
         projects = aa_data / "projects"
         renamed = project != options["source_project"]

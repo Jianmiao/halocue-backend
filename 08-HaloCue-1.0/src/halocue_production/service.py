@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import datetime as dt
+import io
+import mimetypes
 import re
+import threading
+import uuid
+import zipfile
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .artifacts import ArtifactStore
+from .asset_manifests import AssetManifestStore
+from .contracts import canonical_json_bytes, contract_content_hash, sha256_bytes
 from .config import Settings
-from .errors import ProductionError
 from .direction_models import CancellableModelProvider, DirectionModelGateway
+from .errors import ProductionError
+from .formal_inputs import FormalProductionInputs
 from .jobs import CancellationToken, JobOutcome, JobRegistry
 from .legacy_adapter import Legacy093Adapter
 from .models import ProductionRun, ScriptRelease, WorkItem, content_sha256, new_id, utc_now
@@ -17,7 +28,21 @@ from .resource_catalog import ResourceCatalog
 from .name_baseline import CharacterNameBaseline
 from .resource_previews import ResourcePreview
 from .settings_store import SettingsStore
-from .asset_staging import AssetStaging
+from .asset_staging import (
+    MAX_ARCHIVE_BYTES,
+    MAX_ARCHIVE_FILES,
+    AssetStaging,
+)
+from .adapters import (
+    AdapterRegistry,
+    AdapterRequest,
+    AzureArchiveAdapter,
+    BuildBundleAssembler,
+    DraftRef,
+    PerformanceDraftStore,
+    StoryForgeAdapter,
+    StoryForgeRenderer,
+)
 
 
 INVALID_PROJECT = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -26,6 +51,8 @@ UPSTREAM_RELEASE_ID = re.compile(r"release-[0-9a-f]{12}")
 WORK_ID = re.compile(r"work-[0-9a-f]{12}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SCRIPT_RELEASE_SCHEMA_VERSION = "1.0"
+_TASK_ASSET_NAMESPACE = uuid.UUID("40b0223c-3395-4b1b-aeaf-96c9f030c3e7")
+_MANIFEST_SUCCESSOR_NAMESPACE = uuid.UUID("0193c639-c212-45f2-9735-317b87b74a35")
 DIRECTIVE_COMMANDS = frozenset({
     "bg", "trans", "bgfx", "popup", "bgm", "music", "se", "sound", "place", "wait",
     "enter", "exit", "move", "stage", "auto", "camera", "camera_hold", "fx", "hl",
@@ -40,6 +67,24 @@ class ProductionService:
         settings.prepare()
         self.settings = settings
         self.repository = ProductionRepository(settings.data_dir)
+        self.artifacts = ArtifactStore(
+            settings.data_dir / "workspace", self.repository.runtime
+        )
+        self.asset_manifests = AssetManifestStore(
+            self.artifacts, self.repository.runtime
+        )
+        self.formal_inputs = FormalProductionInputs(
+            self.artifacts, self.repository.runtime
+        )
+        self._formal_request_lock = threading.RLock()
+        for existing_run in self.repository.list_runs():
+            formal_request = existing_run.source_summary.get("production_request")
+            if (
+                isinstance(formal_request, dict)
+                and formal_request.get("contract_kind") == "ProductionRequest/1.1"
+            ):
+                continue
+            self.asset_manifests.ensure_compatibility_manifest(existing_run)
         self.settings_store = SettingsStore(settings.data_dir)
         persisted = self.settings_store.load()
         if settings.aa_data is None and persisted.get("aa_data"):
@@ -52,6 +97,25 @@ class ProductionService:
             if configured_aa:
                 self.settings = replace(settings, aa_data=configured_aa)
         self.adapter = Legacy093Adapter(self.settings)
+        self.formal_drafts = PerformanceDraftStore(
+            self.artifacts, self.repository.runtime
+        )
+        self.build_bundles = BuildBundleAssembler(
+            self.artifacts, staging_root=self.settings.data_dir
+        )
+        self.production_adapters = AdapterRegistry(
+            [
+                AzureArchiveAdapter(
+                    self.adapter,
+                    self.formal_drafts,
+                    bundle_publisher=self.build_bundles,
+                ),
+                StoryForgeAdapter(
+                    StoryForgeRenderer(self.artifacts),
+                    self.formal_drafts,
+                ),
+            ]
+        )
         self.name_baseline = CharacterNameBaseline(self.settings.name_baseline)
         self.resources = ResourceCatalog(
             self.settings.resource_index,
@@ -160,13 +224,22 @@ class ProductionService:
             "state": "available",
             "schema_version": "1.0",
             "contract_kind": "WritingHandoff/1.0",
-            "formal_contract": "ScriptRelease/1.0",
-            "formal_contract_state": "not_connected",
+            "formal_contract": "ScriptRelease/1.1",
+            "formal_request": "ProductionRequest/1.1",
+            "formal_contract_state": "available",
+            "content_transport": "registered_workspace_uri",
             "identity_fields": ["id", "display_version", "content_hash"],
             "content_hash": "sha256",
             "idempotent": True,
         }
         return capabilities
+
+    def adapter_capabilities(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "contract": "AdapterCapabilities/1.0",
+            "adapters": self.production_adapters.all_capabilities(),
+        }
 
     @staticmethod
     def _upstream_script_release(
@@ -565,17 +638,353 @@ class ProductionService:
             run.state = "waiting_for_review"
             run.updated_at = utc_now()
             self.repository.save_run(run)
-            result["run"] = self.run_detail(run_id)["run"]
-            result["draft"] = self.run_detail(run_id)["draft"]
-            result["gates"] = self.run_detail(run_id)["gates"]
+            detail = self.run_detail(run_id)
+            result["run"] = detail["run"]
+            result["draft"] = detail["draft"]
+            result["gates"] = detail["gates"]
+            result["asset_manifest"] = detail["asset_manifest"]
+            result["asset_policy"] = detail["asset_policy"]
+            result["asset_manifest_upgrade_required"] = True
         return result
 
     def task_assets(self, run_id: str) -> dict[str, Any]:
         run = self._run(run_id)
-        return {"ok": True, "run_id": run_id, "items": self.adapter.list_task_assets(str(run.draft_token))}
+        manifest = self.asset_manifests.payload_for_run(run_id)
+        allowlisted = {
+            str(asset.get("metadata", {}).get("task_asset_id") or "")
+            for asset in manifest["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        }
+        items = [
+            {**item, "allowlisted": item["asset_id"] in allowlisted}
+            for item in self.adapter.list_task_assets(str(run.draft_token))
+        ]
+        return {"ok": True, "run_id": run_id, "items": items}
+
+    @staticmethod
+    def _task_asset_ids(payload: dict[str, Any], field: str) -> list[str]:
+        value = payload.get(field, [])
+        if not isinstance(value, list) or len(value) > 100:
+            raise ProductionError(
+                "asset_manifest_change_invalid",
+                f"{field} 必须是不超过 100 项的数组",
+            )
+        values = [str(item or "").strip() for item in value]
+        if any(not re.fullmatch(r"asset-[0-9a-f]{12}", item) for item in values):
+            raise ProductionError(
+                "asset_manifest_change_invalid", f"{field} 包含无效素材 ID"
+            )
+        if len(values) != len(set(values)):
+            raise ProductionError(
+                "asset_manifest_change_invalid", f"{field} 不得包含重复素材 ID"
+            )
+        return values
+
+    @staticmethod
+    def _deterministic_bundle(source: Path) -> bytes:
+        files: list[tuple[str, Path]] = []
+        total = 0
+        for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_symlink():
+                raise ProductionError(
+                    "task_asset_corrupt", "角色素材包含不安全的符号链接", status=500
+                )
+            if not path.is_file():
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(source.resolve())
+                size = resolved.stat().st_size
+            except (OSError, ValueError) as exc:
+                raise ProductionError(
+                    "task_asset_corrupt", "角色素材内容无法安全读取", status=500
+                ) from exc
+            total += size
+            files.append((path.relative_to(source).as_posix(), resolved))
+        if (
+            not files
+            or len(files) > MAX_ARCHIVE_FILES
+            or total > MAX_ARCHIVE_BYTES
+        ):
+            raise ProductionError(
+                "task_asset_corrupt", "角色素材包内容为空或超出安全限制", status=500
+            )
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+            for relative, path in files:
+                info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_STORED
+                info.create_system = 3
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, path.read_bytes())
+        return output.getvalue()
+
+    @staticmethod
+    def _duplicate_workspace_file(error: ProductionError, artifacts: ArtifactStore):
+        if error.code != "workspace_file_duplicate":
+            raise error
+        existing_uri = str(error.details.get("existing_uri") or "")
+        if not existing_uri:
+            raise error
+        return artifacts.get(existing_uri)
+
+    def _freeze_task_asset(
+        self, run: ProductionRun, task_asset_id: str
+    ) -> dict[str, Any]:
+        if not run.production_run_id:
+            raise ProductionError(
+                "production_run_identity_invalid", "制作任务缺少稳定身份", status=500
+            )
+        record, source = self.adapter.task_asset_record(
+            str(run.draft_token), task_asset_id
+        )
+        asset_id = str(
+            uuid.uuid5(
+                _TASK_ASSET_NAMESPACE,
+                f"{run.production_run_id}:{task_asset_id}",
+            )
+        )
+        kind = str(record.get("kind") or "")
+        contract_kind = {
+            "background": "background",
+            "cg": "popup",
+            "sound": "sound",
+            "character": "character",
+        }.get(kind)
+        if contract_kind is None:
+            raise ProductionError(
+                "invalid_asset_kind", "任务素材类型无法写入 AssetManifest"
+            )
+        metadata = {
+            "task_asset_id": task_asset_id,
+            "engine_key": str(record.get("key") or ""),
+        }
+        if kind == "character":
+            uri = f"workspace://assets/items/{asset_id}/bundle.zip"
+            try:
+                artifact = self.artifacts.commit_bytes(
+                    uri,
+                    self._deterministic_bundle(source),
+                    kind=contract_kind,
+                    media_type="application/zip",
+                    metadata=metadata,
+                )
+            except ProductionError as exc:
+                artifact = self._duplicate_workspace_file(exc, self.artifacts)
+        else:
+            suffix = source.suffix.casefold()
+            uri = f"workspace://assets/items/{asset_id}/content{suffix}"
+            media_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+            try:
+                artifact = self.artifacts.commit_file(
+                    uri,
+                    source,
+                    kind=contract_kind,
+                    media_type=media_type,
+                    metadata=metadata,
+                )
+            except ProductionError as exc:
+                artifact = self._duplicate_workspace_file(exc, self.artifacts)
+        return {
+            "asset_id": asset_id,
+            "kind": contract_kind,
+            "uri": artifact.uri,
+            "content_hash": artifact.content_hash,
+            "display_name": str(record.get("display_name") or record.get("key") or task_asset_id),
+            "media_type": artifact.media_type,
+            "metadata": metadata,
+        }
+
+    @staticmethod
+    def _successor_manifest(
+        run: ProductionRun,
+        current: dict[str, Any],
+        assets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        ordered = sorted(assets, key=lambda item: item["asset_id"])
+        digest = sha256_bytes(canonical_json_bytes(ordered))
+        manifest_id = str(
+            uuid.uuid5(
+                _MANIFEST_SUCCESSOR_NAMESPACE,
+                f'{run.production_run_id}:{current["id"]}:{digest}',
+            )
+        )
+        created_at = dt.datetime.fromisoformat(
+            str(current["created_at"]).replace("Z", "+00:00")
+        ) + dt.timedelta(microseconds=1)
+        payload: dict[str, Any] = {
+            "schema_version": "1.0",
+            "id": manifest_id,
+            "content_hash": "",
+            "created_at": created_at.isoformat(),
+            "assets": ordered,
+        }
+        payload["content_hash"] = contract_content_hash("AssetManifest", payload)
+        return payload
+
+    def upgrade_asset_manifest(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        unexpected = sorted(
+            set(payload)
+            - {
+                "expected_manifest_id",
+                "expected_content_hash",
+                "add_task_asset_ids",
+                "remove_task_asset_ids",
+            }
+        )
+        if unexpected:
+            raise ProductionError(
+                "asset_manifest_change_invalid",
+                "素材清单升级请求包含未知字段",
+                details={"fields": unexpected},
+            )
+        expected_id = str(payload.get("expected_manifest_id") or "").strip()
+        expected_hash = str(payload.get("expected_content_hash") or "").strip()
+        try:
+            if str(uuid.UUID(expected_id)) != expected_id:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ProductionError(
+                "asset_manifest_reference_invalid", "expected_manifest_id 必须是规范 UUID"
+            ) from exc
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_hash):
+            raise ProductionError(
+                "asset_manifest_reference_invalid",
+                "expected_content_hash 必须是规范 SHA-256",
+            )
+        additions = self._task_asset_ids(payload, "add_task_asset_ids")
+        removals = self._task_asset_ids(payload, "remove_task_asset_ids")
+        if not additions and not removals:
+            raise ProductionError(
+                "asset_manifest_change_empty", "素材清单升级必须包含添加或移除项"
+            )
+        overlap = sorted(set(additions) & set(removals))
+        if overlap:
+            raise ProductionError(
+                "asset_manifest_change_invalid",
+                "同一素材不能同时添加和移除",
+                details={"asset_ids": overlap},
+            )
+        run = self._run(run_id)
+        current_description = self.asset_manifests.describe_for_run(run_id)
+        current = self.asset_manifests.payload_for_run(run_id)
+        by_task_id = {
+            str(asset.get("metadata", {}).get("task_asset_id") or ""): asset
+            for asset in current["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        }
+        already_applied = all(item in by_task_id for item in additions) and all(
+            item not in by_task_id for item in removals
+        )
+        if current["id"] != expected_id or current["content_hash"] != expected_hash:
+            if already_applied:
+                return {
+                    "ok": True,
+                    "run_id": run_id,
+                    "asset_manifest": current_description["reference"],
+                    "asset_policy": current_description["policy"],
+                    "idempotent": True,
+                    "added_task_asset_ids": additions,
+                    "removed_task_asset_ids": removals,
+                }
+            raise ProductionError(
+                "asset_manifest_revision_conflict",
+                "AssetManifest 已被其他操作升级",
+                status=409,
+                details={
+                    "run_id": run_id,
+                    "current_manifest_id": current["id"],
+                    "current_content_hash": current["content_hash"],
+                },
+            )
+        next_assets = [
+            asset
+            for asset in current["assets"]
+            if str(asset.get("metadata", {}).get("task_asset_id") or "")
+            not in removals
+        ]
+        existing_ids = {asset["metadata"].get("task_asset_id") for asset in next_assets}
+        for task_asset_id in additions:
+            if task_asset_id not in existing_ids:
+                next_assets.append(self._freeze_task_asset(run, task_asset_id))
+        if next_assets == current["assets"]:
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "asset_manifest": current_description["reference"],
+                "asset_policy": current_description["policy"],
+                "idempotent": True,
+                "added_task_asset_ids": additions,
+                "removed_task_asset_ids": removals,
+            }
+        successor = self._successor_manifest(run, current, next_assets)
+        description = self.asset_manifests.advance(
+            run,
+            successor,
+            expected_manifest_id=expected_id,
+            expected_content_hash=expected_hash,
+            source_kind="task_asset_upgrade",
+            selection_kind="user_asset_upgrade",
+        )
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "asset_manifest": description["reference"],
+            "asset_policy": description["policy"],
+            "idempotent": False,
+            "previous_manifest_id": current["id"],
+            "added_task_asset_ids": additions,
+            "removed_task_asset_ids": removals,
+        }
+
+    def asset_manifest_history(self, run_id: str) -> dict[str, Any]:
+        self._run(run_id)
+        history = self.asset_manifests.history_for_run(run_id)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "items": [
+                {
+                    "asset_manifest": item["reference"],
+                    "asset_policy": item["policy"],
+                    "predecessor_manifest_id": item["predecessor_manifest_id"],
+                    "selection_kind": item["selection_kind"],
+                    "selected_at": item["selected_at"],
+                }
+                for item in history
+            ],
+        }
+
+    def _require_task_assets_allowlisted(self, run: ProductionRun) -> None:
+        manifest = self.asset_manifests.payload_for_run(run.run_id)
+        allowed = {
+            str(asset.get("metadata", {}).get("task_asset_id") or "")
+            for asset in manifest["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        }
+        missing = sorted(
+            item["asset_id"]
+            for item in self.adapter.list_task_assets(str(run.draft_token))
+            if item["asset_id"] not in allowed
+        )
+        if missing:
+            raise ProductionError(
+                "asset_reference_not_allowed",
+                "自定义素材尚未进入当前任务的冻结白名单",
+                status=409,
+                details={"run_id": run.run_id, "task_asset_ids": missing},
+            )
 
     def remove_task_asset(self, run_id: str, asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         run = self._run(run_id)
+        current_manifest = self.asset_manifests.payload_for_run(run_id)
+        was_allowlisted = any(
+            asset.get("metadata", {}).get("task_asset_id") == asset_id
+            for asset in current_manifest["assets"]
+            if isinstance(asset.get("metadata"), dict)
+        )
         self.adapter.remove_task_asset(
             token=str(run.draft_token), asset_id=asset_id,
             expected_draft_version=self._expected_version(payload),
@@ -583,7 +992,10 @@ class ProductionService:
         run.state = "waiting_for_review"
         run.updated_at = utc_now()
         self.repository.save_run(run)
-        return self.run_detail(run_id)
+        result = self.run_detail(run_id)
+        result["asset_manifest_upgrade_required"] = was_allowlisted
+        result["removed_task_asset_id"] = asset_id
+        return result
 
     def run_resource_preview(self, run_id: str, kind: str, key: str) -> ResourcePreview:
         run = self._run(run_id)
@@ -627,6 +1039,12 @@ class ProductionService:
         return {"ok": True, "run_id": run_id, "usage": usage}
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "schema_version" in payload:
+            with self._formal_request_lock:
+                return self._create_formal_run(payload)
+        return self._create_compatibility_run(payload)
+
+    def _create_compatibility_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         generation_mode = str(payload.get("generation_mode") or "format_only").strip()
         if generation_mode not in {"format_only", "ai_direction"}:
             raise ProductionError(
@@ -656,13 +1074,45 @@ class ProductionService:
                 return result
         release = ScriptRelease.create(project, text, source_kind)
         self.repository.save_release(release, text)
+        run = self._initialize_run(
+            project=project,
+            text=text,
+            source_kind=source_kind,
+            source_filename=source_filename,
+            release_id=release.release_id,
+            generation_mode=generation_mode,
+            upstream_release=upstream_release,
+        )
+        self.asset_manifests.ensure_compatibility_manifest(run)
+        result = self.run_detail(run.run_id)
+        if upstream_release:
+            result["handoff"] = {
+                "kind": "script_release",
+                "idempotent": False,
+                "upstream_release": upstream_release,
+            }
+        return result
 
+    def _initialize_run(
+        self,
+        *,
+        project: str,
+        text: str,
+        source_kind: str,
+        source_filename: str | None,
+        release_id: str,
+        generation_mode: str,
+        upstream_release: dict[str, Any] | None,
+        production_request: dict[str, Any] | None = None,
+    ) -> ProductionRun:
         summary = self.adapter.inspect_script(text)
         summary["source_kind"] = source_kind
         if source_filename:
             summary["source_filename"] = source_filename
         if upstream_release:
             summary["upstream_release"] = upstream_release
+        if production_request:
+            summary["production_request"] = production_request
         draft = self.adapter.create_performance_draft(
             project=project,
             text=text,
@@ -673,7 +1123,7 @@ class ProductionService:
         run = ProductionRun(
             run_id=new_id("run"),
             project=project,
-            release_id=release.release_id,
+            release_id=release_id,
             draft_token=draft["session"]["draft_token"],
             state="waiting_for_review",
             current_stage="preflight",
@@ -689,13 +1139,79 @@ class ProductionService:
         )
         run.source_summary["generation_mode"] = generation_mode
         self.repository.save_run(run)
-        result = self.run_detail(run.run_id)
-        if upstream_release:
+        return run
+
+    def _create_formal_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = self.formal_inputs.validate_request(payload)
+        existing_request = self.formal_inputs.existing_request(request)
+        if existing_request is not None:
+            result = self.run_detail(existing_request["run_id"])
             result["handoff"] = {
-                "kind": "script_release",
-                "idempotent": False,
-                "upstream_release": upstream_release,
+                "kind": "production_request",
+                "idempotent": True,
+                "request_id": request["request_id"],
+                "release_id": request["script_release"]["id"],
             }
+            return result
+
+        self.asset_manifests.validate_reference(request["asset_manifest"])
+        release, text = self.formal_inputs.freeze_script_release(request)
+        project = self._project_name(request["production_display_name"])
+        upstream_release = {
+            "kind": "halocue_writing",
+            "contract_kind": "ScriptRelease/1.1",
+            "formal_script_release": True,
+            "schema_version": release["schema_version"],
+            "release_id": release["id"],
+            "work_id": release["work_id"],
+            "display_version": release["display_version"],
+            "content_hash": release["content_hash"],
+            "manifest_uri": release["manifest_uri"],
+            "content_uri": release["content_uri"],
+            "writing_pack_version": release["writing_pack_version"],
+        }
+        request_summary = {
+            "contract_kind": "ProductionRequest/1.1",
+            "schema_version": request["schema_version"],
+            "request_id": request["request_id"],
+            "idempotency_key": request["idempotency_key"],
+            "asset_manifest_id": request["asset_manifest"]["id"],
+            "target": request["production_policy"]["target"],
+        }
+        run = self._run_for_upstream_release(upstream_release)
+        if run is not None:
+            pending = run.source_summary.get("production_request")
+            if not isinstance(pending, dict) or any(
+                pending.get(key) != request_summary[key]
+                for key in ("request_id", "idempotency_key", "asset_manifest_id", "target")
+            ):
+                raise ProductionError(
+                    "production_request_conflict",
+                    "该 ScriptRelease 已由另一份 ProductionRequest 创建制作任务",
+                    status=409,
+                    details={"release_id": release["id"], "run_id": run.run_id},
+                )
+        else:
+            run = self._initialize_run(
+                project=project,
+                text=text,
+                source_kind="script_release",
+                source_filename=None,
+                release_id=release["id"],
+                generation_mode="format_only",
+                upstream_release=upstream_release,
+                production_request=request_summary,
+            )
+        self.asset_manifests.freeze_reference(run, request["asset_manifest"])
+        request_description = self.formal_inputs.bind_request(request, run)
+        result = self.run_detail(run.run_id)
+        result["production_request"] = request_description
+        result["handoff"] = {
+            "kind": "production_request",
+            "idempotent": False,
+            "request_id": request["request_id"],
+            "release_id": release["id"],
+        }
         return result
 
     def _run_for_upstream_release(
@@ -782,7 +1298,19 @@ class ProductionService:
         run = self._run(run_id)
         draft = self.adapter.draft_detail(str(run.draft_token)) if run.draft_token else None
         gates = self._gates(run, draft)
-        return {"ok": True, "run": run.to_dict(), "gates": gates, "draft": draft}
+        manifest = self.asset_manifests.describe_for_run(run_id)
+        result = {
+            "ok": True,
+            "run": run.to_dict(),
+            "gates": gates,
+            "draft": draft,
+            "asset_manifest": manifest["reference"],
+            "asset_policy": manifest["policy"],
+        }
+        production_request = self.formal_inputs.describe_for_run(run_id)
+        if production_request is not None:
+            result["production_request"] = production_request
+        return result
 
     def performance_preview(self, run_id: str) -> dict[str, Any]:
         """Build a read-only, task-local representation for the draft preview.
@@ -1327,6 +1855,7 @@ class ProductionService:
 
     def validate(self, run_id: str) -> dict[str, Any]:
         run = self._run(run_id)
+        self._require_task_assets_allowlisted(run)
         return self.adapter.validate(str(run.draft_token))
 
     def compile(
@@ -1337,6 +1866,7 @@ class ProductionService:
         work_item_id: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         run = self._run(run_id)
+        self._require_task_assets_allowlisted(run)
         try:
             expected = int(payload["expected_draft_version"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -1399,6 +1929,173 @@ class ProductionService:
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict()), "build_id": build_id}
 
+    def _formal_adapter_request(
+        self,
+        request: dict[str, Any],
+        *,
+        target: str | None = None,
+        run_id: str | None = None,
+        work_item_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> AdapterRequest:
+        manifest = self.asset_manifests.validate_reference(request["asset_manifest"])
+        return AdapterRequest(
+            request,
+            asset_manifest=manifest,
+            target=target or request["production_policy"]["target"],
+            run_id=run_id,
+            work_item_id=work_item_id,
+            attempt_id=attempt_id,
+        )
+
+    def _load_formal_draft_revision(self, revision_id: str) -> DraftRef:
+        record = self.repository.runtime.get_formal_performance_draft_revision(
+            str(revision_id or "").strip()
+        )
+        if record is None:
+            raise ProductionError(
+                "performance_draft_not_found",
+                "PerformanceDraft Revision 不存在",
+                status=404,
+                details={"revision_id": str(revision_id or "")},
+            )
+        return self.formal_drafts.load(record["artifact_uri"])
+
+    def _adapter_result_payload(
+        self,
+        result: Any,
+        *,
+        request: AdapterRequest,
+        draft_ref: DraftRef,
+        adapter: Any,
+        target: str,
+        cancelled: callable,
+    ) -> dict[str, Any]:
+        cancelled()
+        payload = result.to_dict()
+        bundle_ref = result.bundle_ref
+        artifact_refs = tuple(result.artifact_refs)
+        if bundle_ref is not None:
+            verified = self.artifacts.get_artifact(bundle_ref.artifact_uri)
+            if verified.content_hash != bundle_ref.content_hash:
+                raise ProductionError(
+                    "build_bundle_hash_mismatch",
+                    "适配器返回的 BuildBundle 哈希校验失败",
+                    status=500,
+                )
+        elif artifact_refs:
+            deliverables = [self.artifacts.get_artifact(uri) for uri in artifact_refs]
+            capabilities = adapter.capabilities()
+            bundle = self.build_bundles.assemble(
+                request_id=request.request_id,
+                performance_draft_id=draft_ref.draft_id,
+                input_hashes={
+                    "script_release": request.input_hashes["script_release"],
+                    "performance_draft": draft_ref.content_hash,
+                    "asset_manifest": request.input_hashes["asset_manifest"],
+                },
+                producer={
+                    "adapter_id": str(capabilities["adapter_id"]),
+                    "engine_id": str(capabilities["engine_id"]),
+                    "engine_version": str(capabilities["engine_version"]),
+                },
+                target=target,
+                deliverables=deliverables,
+                created_at=utc_now(),
+                warnings=[{"code": "adapter_warning", "message": item} for item in result.warnings],
+                run_id=request.run_id,
+                work_item_id=request.work_item_id,
+                attempt_id=request.attempt_id,
+                cancelled=cancelled,
+            )
+            payload["bundle_ref"] = bundle.to_dict()
+            payload["artifact_refs"] = [bundle.artifact_uri]
+        cancelled()
+        return payload
+
+    def submit_adapter_operation(
+        self,
+        request: AdapterRequest,
+        draft_ref: DraftRef,
+        *,
+        operation: str,
+        options: Mapping[str, Any] | None = None,
+        work_item_id: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        if operation not in {"compile", "render"}:
+            raise ProductionError(
+                "adapter_operation_invalid",
+                "正式适配器任务只支持 compile 或 render",
+                status=400,
+                details={"operation": operation},
+            )
+        if not isinstance(request, AdapterRequest) or not isinstance(draft_ref, DraftRef):
+            raise ProductionError(
+                "adapter_input_invalid",
+                "正式适配器任务需要 AdapterRequest 和 DraftRef",
+                status=400,
+            )
+        safe_options = dict(options or {})
+        target = str(safe_options.get("target") or request.target).strip().casefold()
+        adapter = self.production_adapters.for_target(target)
+        adapter_id = str(adapter.capabilities()["adapter_id"])
+        input_hashes = {
+            "script_release": request.input_hashes["script_release"],
+            "performance_draft": draft_ref.content_hash,
+            "asset_manifest": request.input_hashes["asset_manifest"],
+        }
+        retry_context = {
+            "request_id": request.request_id,
+            "adapter_id": adapter_id,
+            "target": target,
+            "draft_revision_id": draft_ref.revision_id,
+            "input_hashes": input_hashes,
+        }
+        attempt_holder: dict[str, str | None] = {"attempt_id": None}
+
+        def cancel_adapter() -> None:
+            attempt_id = attempt_holder.get("attempt_id")
+            if attempt_id:
+                adapter.cancel(attempt_id)
+
+        def work(token: CancellationToken) -> dict[str, Any]:
+            attempt_holder["attempt_id"] = token.attempt_id
+            adapter_request = AdapterRequest(
+                request.production_request,
+                asset_manifest=request.asset_manifest,
+                target=request.target,
+                run_id=request.run_id,
+                work_item_id=work_item_id or request.work_item_id,
+                attempt_id=token.attempt_id,
+                cancellation_probe=token.is_cancelled,
+            )
+            token.raise_if_cancelled()
+            if operation == "compile":
+                result = adapter.compile(adapter_request, draft_ref)
+            else:
+                result = adapter.render(adapter_request, draft_ref, safe_options)
+            token.raise_if_cancelled()
+            return self._adapter_result_payload(
+                result,
+                request=adapter_request,
+                draft_ref=draft_ref,
+                adapter=adapter,
+                target=target,
+                cancelled=token.raise_if_cancelled,
+            )
+
+        model = adapter.capabilities()
+        job = self.jobs.submit(
+            f"adapter_{operation}",
+            work,
+            retry_context=retry_context,
+            work_item_id=work_item_id or request.work_item_id,
+            provider=str(model["engine_id"]),
+            model_or_engine=str(model["engine_version"]),
+            on_cancel=cancel_adapter,
+        )
+        return 202, {"ok": True, "job": self._job_public(job.to_dict())}
+
     def job_detail(self, job_id: str) -> dict[str, Any]:
         job = self.jobs.get(job_id)
         if not job:
@@ -1409,6 +2106,11 @@ class ProductionService:
         job = self.jobs.get(job_id)
         if not job:
             raise ProductionError("job_not_found", "后台任务不存在", status=404)
+        if job.kind in {"adapter_compile", "adapter_render"} and job.attempt_id:
+            context = job.retry_context if isinstance(job.retry_context, dict) else {}
+            adapter_id = str(context.get("adapter_id") or "").strip()
+            if adapter_id:
+                self.production_adapters.for_adapter(adapter_id).cancel(job.attempt_id)
         if not self.jobs.cancel(job_id):
             raise ProductionError(
                 "job_not_cancellable",
@@ -1442,7 +2144,56 @@ class ProductionService:
         context = job.retry_context if isinstance(job.retry_context, dict) else {}
         kind = job.kind
         run_id = job.run_id
-        if kind == "model_connection_test":
+        if kind in {"adapter_compile", "adapter_render"}:
+            required = {
+                "request_id",
+                "adapter_id",
+                "target",
+                "draft_revision_id",
+                "input_hashes",
+            }
+            if set(context) != required or not isinstance(context.get("input_hashes"), dict):
+                raise ProductionError(
+                    "job_retry_unavailable",
+                    "适配器任务缺少安全的冻结输入，无法重试",
+                    status=409,
+                    details={"kind": kind},
+                )
+            request_payload = self.formal_inputs.load_request(str(context["request_id"]))
+            request = self._formal_adapter_request(
+                request_payload,
+                target=request_payload["production_policy"]["target"],
+                work_item_id=job.work_item_id,
+            )
+            adapter = self.production_adapters.for_adapter(str(context["adapter_id"]))
+            routed = self.production_adapters.for_target(str(context["target"]))
+            if routed is not adapter:
+                raise ProductionError(
+                    "job_retry_input_conflict",
+                    "适配器任务的 target 与 adapter_id 不一致",
+                    status=409,
+                )
+            draft = self._load_formal_draft_revision(str(context["draft_revision_id"]))
+            stored_hashes = context["input_hashes"]
+            expected_hashes = {
+                "script_release": request.input_hashes["script_release"],
+                "performance_draft": draft.content_hash,
+                "asset_manifest": request.input_hashes["asset_manifest"],
+            }
+            if stored_hashes != expected_hashes:
+                raise ProductionError(
+                    "job_retry_input_conflict",
+                    "适配器任务的冻结输入哈希已经变化",
+                    status=409,
+                )
+            _, response = self.submit_adapter_operation(
+                request,
+                draft,
+                operation="compile" if kind == "adapter_compile" else "render",
+                options={"target": str(context["target"])},
+                work_item_id=job.work_item_id,
+            )
+        elif kind == "model_connection_test":
             _, response = self.test_direction_model(work_item_id=job.work_item_id)
         elif kind == "ai_preflight" and run_id:
             _, response = self.start_ai_preflight(run_id, work_item_id=job.work_item_id)
@@ -1510,6 +2261,17 @@ class ProductionService:
             kind == "model_connection_test"
             or (kind == "ai_preflight" and bool(job.get("run_id")))
             or (
+                kind in {"adapter_compile", "adapter_render"}
+                and set(retry_context)
+                == {
+                    "request_id",
+                    "adapter_id",
+                    "target",
+                    "draft_revision_id",
+                    "input_hashes",
+                }
+            )
+            or (
                 kind in {"cg_advice", "direction_generation", "compile"}
                 and bool(job.get("run_id"))
                 and "expected_draft_version" in retry_context
@@ -1525,13 +2287,15 @@ class ProductionService:
             "ai_preflight": "AI 初审（只读建议）",
             "model_connection_test": "测试演出模型连接",
             "cg_advice": "生成 CG 制作意见",
+            "adapter_compile": "适配器编译",
+            "adapter_render": "适配器渲染",
         }.get(kind, kind or "后台任务")
         if state == "succeeded":
             next_action = {"label": "已完成", "detail": "结果已写回关联任务。", "stage": None}
         elif state == "cancelled":
             next_action = {"label": "已取消", "detail": "已阻止该次任务提交结果。", "stage": None}
         elif state in {"failed", "abandoned", "interrupted"}:
-            stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation"} else None
+            stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation", "adapter_compile", "adapter_render"} else None
             next_action = {
                 "label": "查看失败原因并回到任务处理",
                 "detail": "修正问题后，从对应步骤重新提交；系统不会自动覆盖现有草稿。",

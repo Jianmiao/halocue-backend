@@ -21,6 +21,10 @@ CONTRACT_NAMES = (
     "ProductionEvent",
     "ApiError",
 )
+CONTRACT_VERSIONS = {
+    name: (("1.0", "1.1") if name in {"ScriptRelease", "ProductionRequest"} else ("1.0",))
+    for name in CONTRACT_NAMES
+}
 
 _HASH = re.compile(r"sha256:[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9._-]{1,79}")
@@ -350,47 +354,53 @@ def _private_data_guard(value: Any, contract: str, path: str = "$") -> None:
             _private_data_guard(item, contract, f"{path}[{index}]")
 
 
-def _base(payload: Any, contract: str) -> dict[str, Any]:
+def _base(payload: Any, contract: str) -> tuple[dict[str, Any], str]:
     value = _object(payload, contract, "$")
     version = value.get("schema_version")
-    if version != CONTRACT_VERSION:
+    supported = CONTRACT_VERSIONS[contract]
+    if version not in supported:
         raise ContractValidationError(
             "unsupported_contract_version",
             contract,
             "$.schema_version",
             f"unsupported {contract} contract version",
-            details={"received": version, "supported": [CONTRACT_VERSION]},
+            details={"received": version, "supported": list(supported)},
         )
     _private_data_guard(value, contract)
-    return value
+    return value, str(version)
 
 
 def _script_release(payload: Any) -> None:
     contract = "ScriptRelease"
-    value = _base(payload, contract)
+    value, version = _base(payload, contract)
+    required = {
+        "schema_version",
+        "id",
+        "work_id",
+        "display_version",
+        "manifest_uri",
+        "content_hash",
+        "canon_revision_id",
+        "writing_pack_version",
+        "source_revision_ids",
+        "gate_snapshot_ids",
+        "released_by",
+        "released_at",
+    }
+    if version == "1.1":
+        required.add("content_uri")
     _fields(
         value,
         contract,
         "$",
-        required={
-            "schema_version",
-            "id",
-            "work_id",
-            "display_version",
-            "manifest_uri",
-            "content_hash",
-            "canon_revision_id",
-            "writing_pack_version",
-            "source_revision_ids",
-            "gate_snapshot_ids",
-            "released_by",
-            "released_at",
-        },
+        required=required,
     )
     _uuid(value["id"], contract, "$.id")
     _uuid(value["work_id"], contract, "$.work_id")
     _string(value["display_version"], contract, "$.display_version", maximum=40)
     _uri(value["manifest_uri"], contract, "$.manifest_uri", schemes={"workspace"})
+    if version == "1.1":
+        _uri(value["content_uri"], contract, "$.content_uri", schemes={"workspace"})
     _hash(value["content_hash"], contract, "$.content_hash")
     _uuid(value["canon_revision_id"], contract, "$.canon_revision_id")
     _string(value["writing_pack_version"], contract, "$.writing_pack_version", maximum=120)
@@ -402,34 +412,56 @@ def _script_release(payload: Any) -> None:
 
 def _production_request(payload: Any) -> None:
     contract = "ProductionRequest"
-    value = _base(payload, contract)
+    value, version = _base(payload, contract)
+    required = {
+        "schema_version",
+        "request_id",
+        "script_release",
+        "script_manifest_version",
+        "asset_manifest",
+        "production_policy",
+        "idempotency_key",
+    }
+    if version == "1.1":
+        required.add("production_display_name")
     _fields(
         value,
         contract,
         "$",
-        required={
-            "schema_version",
-            "request_id",
-            "script_release",
-            "script_manifest_version",
-            "asset_manifest",
-            "production_policy",
-            "idempotency_key",
-        },
+        required=required,
     )
     _uuid(value["request_id"], contract, "$.request_id")
+    if version == "1.1":
+        _string(
+            value["production_display_name"],
+            contract,
+            "$.production_display_name",
+            maximum=120,
+        )
     release = _object(value["script_release"], contract, "$.script_release")
+    release_required = {"id", "display_version", "content_hash", "manifest_uri"}
+    if version == "1.1":
+        release_required.update({"version", "content_uri"})
     _fields(
         release,
         contract,
         "$.script_release",
-        required={"id", "display_version", "content_hash", "manifest_uri"},
+        required=release_required,
     )
     _uuid(release["id"], contract, "$.script_release.id")
     _string(release["display_version"], contract, "$.script_release.display_version", maximum=40)
     _hash(release["content_hash"], contract, "$.script_release.content_hash")
     _uri(release["manifest_uri"], contract, "$.script_release.manifest_uri", schemes={"workspace"})
-    if value["script_manifest_version"] != CONTRACT_VERSION:
+    if version == "1.1":
+        if release["version"] != "1.1":
+            _fail(contract, "$.script_release.version", "unsupported ScriptRelease version")
+        _uri(
+            release["content_uri"],
+            contract,
+            "$.script_release.content_uri",
+            schemes={"workspace"},
+        )
+    if value["script_manifest_version"] != version:
         _fail(contract, "$.script_manifest_version", "unsupported script manifest version")
     manifest = _object(value["asset_manifest"], contract, "$.asset_manifest")
     _fields(
@@ -465,7 +497,7 @@ def _production_request(payload: Any) -> None:
 
 def _performance_draft(payload: Any) -> None:
     contract = "PerformanceDraft"
-    value = _base(payload, contract)
+    value, _ = _base(payload, contract)
     _fields(
         value,
         contract,
@@ -768,7 +800,7 @@ def _choice_group(
 
 def _asset_manifest(payload: Any) -> None:
     contract = "AssetManifest"
-    value = _base(payload, contract)
+    value, _ = _base(payload, contract)
     _fields(
         value,
         contract,
@@ -824,7 +856,7 @@ def _asset_manifest(payload: Any) -> None:
 
 def _adapter_capabilities(payload: Any) -> None:
     contract = "AdapterCapabilities"
-    value = _base(payload, contract)
+    value, _ = _base(payload, contract)
     _fields(
         value,
         contract,
@@ -872,7 +904,12 @@ def _adapter_capabilities(payload: Any) -> None:
     ):
         versions = _list(value[key], contract, f"$.{key}")
         for index, version in enumerate(versions):
-            if version != CONTRACT_VERSION:
+            allowed = (
+                CONTRACT_VERSIONS["ScriptRelease"]
+                if key == "supported_script_manifest_versions"
+                else (CONTRACT_VERSION,)
+            )
+            if version not in allowed:
                 _fail(contract, f"$.{key}[{index}]", "unsupported declared contract version")
     targets = _list(value["targets"], contract, "$.targets")
     for index, target in enumerate(targets):
@@ -881,7 +918,7 @@ def _adapter_capabilities(payload: Any) -> None:
 
 def _build_bundle(payload: Any) -> None:
     contract = "BuildBundle"
-    value = _base(payload, contract)
+    value, _ = _base(payload, contract)
     _fields(
         value,
         contract,
@@ -955,7 +992,7 @@ def _build_bundle(payload: Any) -> None:
 
 def _production_event(payload: Any) -> None:
     contract = "ProductionEvent"
-    value = _base(payload, contract)
+    value, _ = _base(payload, contract)
     _fields(
         value,
         contract,
@@ -1009,7 +1046,7 @@ def _production_event(payload: Any) -> None:
 
 def _api_error(payload: Any) -> None:
     contract = "ApiError"
-    value = _base(payload, contract)
+    value, _ = _base(payload, contract)
     _fields(
         value,
         contract,

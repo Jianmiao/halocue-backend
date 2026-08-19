@@ -1,10 +1,10 @@
 # HaloCue 1.0 核心合同包
 
-状态：B0 的 1.0 冻结基线。本目录的八份 JSON 是正式领域合同样例，可执行规则位于 `src/halocue_production/contracts.py`。当前 AA 兼容 HTTP payload 仍由防腐层处理，不属于这些样例的替代响应。后续不兼容变更必须使用新的合同版本，不能静默改写 1.0 样例或哈希规则。
+状态：B0 的 1.0 冻结基线，以及 B2 经产品确认的 ScriptRelease/ProductionRequest 1.1 增量合同。本目录的 JSON 是正式领域合同样例，可执行规则位于 `src/halocue_production/contracts.py`。当前 AA 兼容 HTTP payload 仍由防腐层处理，不属于这些样例的替代响应。后续不兼容变更必须使用新的合同版本，不能静默改写 1.0 样例或哈希规则。
 
 ## 通用规则
 
-- 每份 payload 必须包含 `schema_version: "1.0"`。
+- 每份 payload 必须包含明确的 `schema_version`。除 ScriptRelease 和 ProductionRequest 同时支持冻结的 `1.0` 与增量 `1.1` 外，其余六份合同当前只支持 `1.0`。
 - 正式持久对象使用 canonical UUID；现有 `release-xxxxxxxxxxxx` 等 ID 只能在兼容边界转换。
 - 哈希统一使用 `sha256:<64 lowercase hex>`。
 - 文件和产物仅使用 `workspace://` 或 `artifact://` URI，不允许系统路径、反斜杠或 `..` 穿越。
@@ -15,14 +15,21 @@
 
 | 合同 | 样例 | 边界 |
 |---|---|---|
-| `ScriptRelease/1.0` | `examples/script-release-1.0.json` | 写作域拥有的不可变发布清单 |
-| `ProductionRequest/1.0` | `examples/production-request-1.0.json` | 制作 Run 的固定输入、白名单和策略 |
+| `ScriptRelease/1.0`, `1.1` | `examples/script-release-1.0.json`, `script-release-1.1.json` | 写作域拥有的不可变发布清单；1.1 显式携带正文 Artifact URI |
+| `ProductionRequest/1.0`, `1.1` | `examples/production-request-1.0.json`, `production-request-1.1.json` | 制作 Run 的固定输入、白名单和策略；1.1 增加非身份制作显示名并引用 ScriptRelease/1.1 |
 | `PerformanceDraft/1.0` | `examples/performance-draft-1.0.json` | 与 AA/StoryForge 无关的标准演出模型 |
 | `AssetManifest/1.0` | `examples/asset-manifest-1.0.json` | 任务冻结素材白名单 |
 | `AdapterCapabilities/1.0` | `examples/adapter-capabilities-1.0.json` | 适配器、引擎、目标和合同版本发现 |
 | `BuildBundle/1.0` | `examples/build-bundle-1.0.json` | 已验证输入与不可变交付物集合 |
 | `ProductionEvent/1.0` | `examples/production-event-1.0.json` | Run/WorkItem/Attempt 关联的单调事件 |
 | `ApiError/1.0` | `examples/api-error-1.0.json` | 可分类、可决策重试、不泄漏私密数据的错误 |
+
+能力发现使用 `GET /api/v1/production-adapters`。外层响应包含
+`contract: "AdapterCapabilities/1.0"` 和适配器数组；数组中的每个对象
+都必须通过 `AdapterCapabilities/1.0` 校验。能力发现只返回稳定标识、引擎
+版本、支持的操作、目标和输入合同版本，不返回 AA 私有 token、模型密钥、
+草稿正文、本机绝对路径或构建目录。`render_video` 不是正式操作名；视频
+导出能力使用 `export_video` 并由适配器明确声明。
 
 ## PerformanceDraft 约束
 
@@ -46,5 +53,17 @@
 
 - 现有 `WRITING_HANDOFF_CONTRACT.md` 的 payload 标记为 `WritingHandoff/1.0`，不是正式 `ScriptRelease/1.0`。
 - 兼容交接继续验证冻结正文哈希、幂等和同 ID 异哈希冲突，但不伪造 UUID、manifest URI、Revision 或 Gate 快照。
-- 正式入口只能接受完整 `ScriptRelease/1.0`；缺少字段时结构化拒绝，不从标题、文件名或数组位置推导。
+- 正式可运行入口只接受完整 `ProductionRequest/1.1` 和 `ScriptRelease/1.1`；缺少字段时结构化拒绝，不从标题、文件名或数组位置推导。
 - 未来转换层必须保留两种合同身份和原始哈希，不就地覆盖兼容记录。
+
+## ProductionRequest 1.1 运行时入口
+
+产品决定采用显式引用方案，不冻结隐式目录布局：
+
+- `ScriptRelease/1.1` 增加 `content_uri`，其 `content_hash` 仍对该 URI 指向的冻结正文文件字节求哈希。
+- `ProductionRequest/1.1` 增加非身份字段 `production_display_name`，并以 `script_release.version: "1.1"`、`manifest_uri`、`content_uri` 和哈希固定上游输入。
+- `ProductionRequest/1.0` 与 `ScriptRelease/1.0` 样例继续可校验和审计，但 1.0 请求不能创建正式 ProductionRun；运行时返回稳定的 `production_request_version_not_runnable`。
+- HTTP 正式入口要求所有引用 URI 已登记到同一本地 ArtifactStore。制作端重新校验 URI、文件哈希、完整 ScriptRelease 清单和 AssetManifest 后，才创建 Draft/Run，并在 SQLite 中保存冻结发布副本和不可变请求绑定。
+- 同一 request ID 不同 envelope 返回 `production_request_identity_conflict`；同一 release ID 不同正文哈希返回 `script_release_identity_conflict`；完全相同的 1.1 请求幂等返回原 Run。
+
+现有 `WritingHandoff/1.0` 兼容路线保持不变。写作和制作组合层在共享 ArtifactStore 与正式 UUID 身份前，不把兼容 payload 冒充为 1.1。

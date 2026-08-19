@@ -10,6 +10,8 @@ It does not contain the writing backend. The integration boundary is a frozen
 ## Current vertical slice
 
 - Create and persist a `ProductionRun` from inline script text.
+- Create a persistent, idempotent formal run from `ProductionRequest/1.1` after
+  validating registered `ScriptRelease/1.1` content and `AssetManifest/1.0` artifacts.
 - Scan script structure and speakers with the 0.9.3 document parser.
 - Create a real 0.9.3-compatible `PerformanceDraft` in the 1.0 data directory.
 - Query production runs, work items, gates, cards, and diagnostics.
@@ -38,16 +40,35 @@ No 0.9.3 source or runtime data is modified.
 
 ## Persistent runtime
 
-`data/runtime.sqlite3` is the fact source for production runs, work items, job
-attempts, and their sequenced runtime events. The schema uses tracked,
-transactional migrations. Existing `data/runs/*.json` and `data/jobs/*.json`
-files are read only as one-way migration inputs; new state is not written back
-to those files.
+`data/runtime.sqlite3` is the fact source for production runs, frozen formal
+ScriptRelease copies, immutable ProductionRequest bindings, work items, job
+attempts, sequenced runtime events, and registered workspace files. The schema
+uses tracked, transactional migrations. Existing `data/runs/*.json` and
+`data/jobs/*.json` files are read only as one-way migration inputs; new state is
+not written back to those files.
+
+Legacy `run-xxxxxxxxxxxx` identifiers remain compatibility aliases. The runtime
+persists each alias in `production_run_identity_map` together with its canonical
+ProductionRun UUID and immutable input hash. Repeating the same alias and input
+is idempotent; reusing an alias for different input returns HTTP 409 with the
+stable `production_run_identity_conflict` code. Run lookup accepts either the
+legacy alias or the canonical UUID, while responses continue to expose both.
+
+`data/workspace` is owned by the ArtifactStore. Domain payloads reference files
+with `workspace://` URIs and `sha256:` hashes, never physical paths. A commit is
+written and flushed to a same-directory temporary file, verified, atomically
+replaced, and then registered in SQLite. Reusing a URI with different bytes is
+rejected instead of silently overwriting the prior file.
 
 On startup, attempts left in `queued` or `running` are marked `abandoned`.
 Retry is always explicit and creates a new attempt for the same work item.
 Cancellation is persisted before it is acknowledged, and late model or compile
 results cannot update the associated run or become the accepted job result.
+Artifact publication is also guarded by the persistent Attempt state: an
+abandoned, cancelled, or missing Attempt cannot register an `artifact://`
+reference or a `BuildBundle`. Adapter retries reuse only the persisted request,
+adapter, target, draft revision, and input hashes; they never reuse the old
+Attempt identity.
 Model providers with streaming support check cancellation while receiving
 chunks. AA compilation runs in a HaloCue-owned child process with a minimal
 environment; cancellation terminates that process and removes the cancelled
@@ -117,6 +138,13 @@ Invoke-RestMethod -Method Post -ContentType application/json `
   -Body $body http://127.0.0.1:8892/api/v1/production-runs
 ```
 
+The same endpoint accepts the formal `ProductionRequest/1.1` example in
+`contracts/examples/production-request-1.1.json`. Its `ScriptRelease/1.1`
+manifest, explicit `content_uri`, and `AssetManifest/1.0` URI must already be
+registered in the local ArtifactStore. The service never derives script content
+from a neighboring filename or directory convention. `ProductionRequest/1.0`
+remains frozen for validation and audit but is not runnable.
+
 ## API contract
 
 All endpoints are under `/api/v1`. Errors use stable codes:
@@ -124,6 +152,12 @@ All endpoints are under `/api/v1`. Errors use stable codes:
 ```json
 {"ok": false, "error": {"code": "review_pending", "message": "...", "details": {}}}
 ```
+
+The compatibility wrapper above is the default. Clients that have adopted the
+formal error contract may send
+`Accept: application/vnd.halocue.api-error+json; version=1.0` to receive a
+direct `ApiError/1.0` object. The negotiated view never includes raw exception
+details, local paths, credentials, or private source text.
 
 The service binds to `127.0.0.1` by default and sends restrictive local-app
 security headers. Source text is accepted only in request bodies; arbitrary
@@ -134,9 +168,27 @@ client filesystem paths are not accepted by this first slice.
 ```text
 GET  /api/v1/health
 GET  /api/v1/capabilities
+GET  /api/v1/production-adapters
 GET  /api/v1/settings/aa-workspace
 POST /api/v1/settings/aa-workspace
 ```
+
+`GET /api/v1/production-adapters` returns the normalized
+`AdapterCapabilities/1.0` documents for the locally registered production
+adapters. The response lists only stable adapter IDs, engine metadata,
+supported operations, contract versions, and targets. It never returns AA
+private tokens, model secrets, draft text, local absolute paths, or build
+directories. A missing capability is reported as a structured
+`adapter_capability_unavailable` error; the endpoint does not imply that every
+listed capability is configured for the current machine.
+
+This endpoint is capability discovery only. There is no direct, unversioned
+HTTP compile/render adapter route. Formal adapter operations are submitted by
+the local composition layer through the validated `AdapterRequest` and
+`PerformanceDraft` boundary, persisted as jobs, and exposed through the
+existing versioned job routes. Adding a public adapter operation requires a
+versioned request/response contract, idempotency rule, unknown-version
+rejection, and `ApiError/1.0` mapping first.
 
 The settings request is `{"path":"E:\\AzureArchive\\...\\data"}`. A valid
 workspace must contain `projects`, `saves`, `overrides`, and `settings`.
@@ -148,6 +200,8 @@ The selected path is persisted only in `08-HaloCue-1.0/data/settings.json`.
 GET  /api/v1/production-runs
 POST /api/v1/production-runs
 GET  /api/v1/production-runs/{run_id}
+GET  /api/v1/production-runs/{run_id}/asset-manifests
+POST /api/v1/production-runs/{run_id}/asset-manifests
 POST /api/v1/production-runs/{run_id}/cast-bindings
 POST /api/v1/production-runs/{run_id}/review/approve
 POST /api/v1/production-runs/{run_id}/validate
@@ -155,6 +209,26 @@ POST /api/v1/production-runs/{run_id}/compile
 POST /api/v1/production-runs/{run_id}/install
 GET  /api/v1/jobs/{job_id}
 ```
+
+Every run has an immutable `AssetManifest/1.0`. Registering a task-local custom
+asset does not silently mutate that manifest. The explicit manifest upgrade
+request is:
+
+```json
+{
+  "expected_manifest_id": "canonical UUID",
+  "expected_content_hash": "sha256:...",
+  "add_task_asset_ids": ["asset-000000000001"],
+  "remove_task_asset_ids": []
+}
+```
+
+The request creates a successor manifest and preserves the prior manifest in
+the run history. Repeating an already-applied request is idempotent. A stale
+head returns `409 asset_manifest_revision_conflict`. Validation and compilation
+return `409 asset_reference_not_allowed` while any registered custom asset is
+outside the current frozen manifest. Responses expose only canonical IDs,
+display metadata, hashes, and `workspace://` URIs.
 
 ### Review cards
 

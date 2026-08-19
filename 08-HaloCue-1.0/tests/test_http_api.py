@@ -8,7 +8,9 @@ import urllib.request
 from contextlib import contextmanager
 
 from halocue_production.app import create_server
+from halocue_production.contracts import validate_contract
 from halocue_production.service import ProductionService
+from test_formal_inputs import formal_request
 from test_service import configured_resource_settings
 from PIL import Image
 from io import BytesIO
@@ -29,13 +31,13 @@ def api(settings):
         thread.join(timeout=2)
 
 
-def request(base: str, path: str, payload=None, method="GET"):
+def request(base: str, path: str, payload=None, method="GET", headers=None):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
         base + path,
         data=body,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -51,6 +53,103 @@ def upload(base: str, path: str, filename: str, content: bytes):
     )
     with urllib.request.urlopen(req, timeout=5) as response:
         return response.status, dict(response.headers), json.loads(response.read())
+
+
+def test_http_accepts_idempotent_production_request_1_1(settings):
+    staging = ProductionService(settings)
+    payload = formal_request(staging)
+    staging.jobs.close()
+
+    with api(settings) as base:
+        status, _, created = request(
+            base, "/api/v1/production-runs", payload, "POST"
+        )
+        assert status == 201
+        assert created["production_request"]["version"] == "1.1"
+        assert created["handoff"]["idempotent"] is False
+        assert str(settings.data_dir) not in json.dumps(created, ensure_ascii=False)
+
+        status, _, repeated = request(
+            base, "/api/v1/production-runs", payload, "POST"
+        )
+        assert status == 200
+        assert repeated["run"]["run_id"] == created["run"]["run_id"]
+        assert repeated["handoff"]["idempotent"] is True
+
+
+def test_http_exposes_formal_production_adapter_capabilities(settings):
+    with api(settings) as base:
+        status, headers, result = request(base, "/api/v1/production-adapters")
+
+    assert status == 200
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert result["ok"] is True
+    assert result["contract"] == "AdapterCapabilities/1.0"
+    for capability in result["adapters"]:
+        validate_contract("AdapterCapabilities", capability)
+    adapters = {item["adapter_id"]: item for item in result["adapters"]}
+    assert adapters["aa-compat"]["targets"] == ["pc_aap"]
+    assert adapters["storyforge-local"]["targets"] == ["storyforge_preview"]
+    assert "compile_aap" not in adapters["storyforge-local"]["capabilities"]
+    public = json.dumps(result, ensure_ascii=False)
+    assert str(settings.data_dir) not in public
+    assert "legacy_root" not in public
+    assert "aa_data" not in public
+    assert "token" not in public.casefold()
+
+
+def test_http_does_not_expose_direct_unversioned_adapter_operation_route(settings):
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/production-adapters/aa-compat/compile",
+            {},
+            "POST",
+        )
+
+    assert status == 404
+    assert result["error"]["code"] == "route_not_found"
+
+
+def test_http_maps_formal_request_version_error_to_stable_api_error(settings):
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/production-runs",
+            {"schema_version": "2.0"},
+            "POST",
+        )
+
+    assert status == 400
+    assert result["ok"] is False
+    assert result["error"]["code"] == "unsupported_production_request_version"
+    assert result["error"]["details"]["path"] == "$.schema_version"
+    assert result["error"]["details"]["received"] == "2.0"
+    assert "supported" in result["error"]["details"]
+    assert "data_dir" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_http_negotiates_formal_api_error_v1_without_legacy_details(settings):
+    body = {
+        "schema_version": "2.0",
+        "private_path": "C:/Users/creator/private.json",
+        "api_key": "negotiated-secret",
+    }
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/production-runs",
+            body,
+            "POST",
+            {"Accept": "application/vnd.halocue.api-error+json; version=1.0"},
+        )
+
+    validate_contract("ApiError", result)
+    assert status == 400
+    assert result["code"] == "UNSUPPORTED_PRODUCTION_REQUEST_VERSION"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "private_path" not in serialized
+    assert "negotiated-secret" not in serialized
 
 
 def test_http_vertical_slice_and_error_contract(settings):
@@ -87,6 +186,30 @@ def test_http_vertical_slice_and_error_contract(settings):
         status, _, listing = request(base, "/api/v1/production-runs")
         assert status == 200
         assert listing["items"][0]["run_id"] == run_id
+
+
+def test_http_accepts_canonical_production_run_uuid_as_a_compatibility_alias(settings):
+    with api(settings) as base:
+        status, _, created = request(
+            base,
+            "/api/v1/production-runs",
+            {
+                "project": "canonical 查询",
+                "source": {"kind": "inline", "text": "旁白: 测试\n"},
+            },
+            "POST",
+        )
+        assert status == 201
+        canonical_id = created["run"]["production_run_id"]
+        legacy_id = created["run"]["run_id"]
+
+        status, _, detail = request(
+            base, f"/api/v1/production-runs/{canonical_id}"
+        )
+
+    assert status == 200
+    assert detail["run"]["production_run_id"] == canonical_id
+    assert detail["run"]["run_id"] == legacy_id
 
 
 def test_http_writing_release_handoff_returns_existing_run_on_retry(settings):
@@ -272,6 +395,26 @@ def test_http_task_asset_upload_validate_register_and_preview(settings, tmp_path
         assert status == 201
         assert registered["asset"]["key"] == "scene"
         assert "private_source" not in registered["asset"]
+        status, _, upgraded = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/asset-manifests",
+            {
+                "expected_manifest_id": created["asset_manifest"]["id"],
+                "expected_content_hash": created["asset_manifest"]["content_hash"],
+                "add_task_asset_ids": [registered["asset"]["asset_id"]],
+                "remove_task_asset_ids": [],
+            },
+            "POST",
+        )
+        assert status == 201
+        assert upgraded["asset_policy"]["revision"] == 2
+        assert upgraded["asset_policy"]["asset_count"] == 1
+        assert "path" not in json.dumps(upgraded, ensure_ascii=False)
+        status, _, history = request(
+            base, f"/api/v1/production-runs/{run_id}/asset-manifests"
+        )
+        assert status == 200
+        assert [item["asset_policy"]["revision"] for item in history["items"]] == [1, 2]
         with urllib.request.urlopen(
             base + f"/api/v1/production-runs/{run_id}/resources/backgrounds/scene/preview", timeout=5
         ) as response:
@@ -288,6 +431,7 @@ def test_http_task_asset_upload_validate_register_and_preview(settings, tmp_path
             "DELETE",
         )
         assert status == 200
+        assert removed["asset_manifest_upgrade_required"] is True
         assert removed["draft"]["draft_version"] == registered["draft"]["draft_version"] + 1
         status, _, assets = request(base, f"/api/v1/production-runs/{run_id}/assets")
         assert status == 200
@@ -540,6 +684,37 @@ def test_http_direction_model_settings_are_redacted(settings, monkeypatch):
         assert status == 200
         assert loaded == saved
         assert "api_key" not in loaded["model"]
+
+
+def test_http_fetch_models_error_redacts_secret_and_private_exception(settings, monkeypatch):
+    original_urlopen = urllib.request.urlopen
+
+    def fail(_request, timeout):
+        if getattr(_request, "full_url", "").startswith("https://example.invalid/"):
+            raise RuntimeError(
+                "fetch failed with http-fetch-secret at C:/Users/creator/model-response.json"
+            )
+        return original_urlopen(_request, timeout=timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    with api(settings) as base:
+        status, _, result = request(
+            base,
+            "/api/v1/settings/direction-model/fetch-models",
+            {
+                "provider": "openai",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "http-fetch-secret",
+            },
+            "POST",
+        )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert status == 502
+    assert result["error"]["code"] == "fetch_models_failed"
+    assert "http-fetch-secret" not in serialized
+    assert "model-response.json" not in serialized
+    assert result["error"]["details"] == {"type": "RuntimeError"}
 
 
 def test_http_file_source_and_aa_environment_routes(settings, tmp_path):

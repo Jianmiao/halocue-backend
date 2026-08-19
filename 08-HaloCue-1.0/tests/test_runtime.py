@@ -61,24 +61,210 @@ def test_runtime_store_creates_current_schema(tmp_path):
     assert {
         "runtime_schema_migrations",
         "production_runs",
+        "production_run_identity_map",
         "work_items",
         "job_attempts",
         "production_events",
+        "workspace_files",
+        "asset_manifests",
+        "production_run_asset_manifest_history",
+        "production_run_asset_manifest_heads",
+        "frozen_script_releases",
+        "production_requests",
     } <= tables
 
 
-def test_runtime_store_upgrades_v1_to_v2(tmp_path):
+def test_runtime_store_upgrades_v6_to_v7_with_immutable_artifact_refs(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    RuntimeStore(path, target_version=6)
+    runtime = RuntimeStore(path)
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(artifact_refs)")
+        }
+
+    assert runtime.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert {
+        "uri",
+        "workspace_uri",
+        "kind",
+        "content_hash",
+        "run_id",
+        "work_item_id",
+        "attempt_id",
+        "created_at",
+    } <= columns
+
+
+def test_runtime_store_upgrades_v7_to_v8_with_formal_draft_revisions(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    RuntimeStore(path, target_version=7)
+
+    runtime = RuntimeStore(path)
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(formal_performance_drafts)"
+            )
+        }
+
+    assert runtime.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert {
+        "revision_id",
+        "draft_id",
+        "run_id",
+        "request_id",
+        "artifact_uri",
+        "content_hash",
+        "review_status",
+        "parent_revision_id",
+        "adapter_id",
+        "created_at",
+    } <= columns
+
+
+def test_runtime_store_upgrades_v1_to_current(tmp_path):
     path = tmp_path / "runtime.sqlite3"
     RuntimeStore(path, target_version=1)
 
     upgraded = RuntimeStore(path)
 
-    assert upgraded.schema_version() == 2
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
     with sqlite3.connect(path) as connection:
         attempt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(job_attempts)")
         }
+        workspace_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workspace_files)")
+        }
     assert "cancellation_requested" in attempt_columns
+    assert {"uri", "relative_path", "content_hash", "size_bytes"} <= workspace_columns
+
+
+def test_runtime_store_upgrades_v3_to_current_without_losing_runs(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=3)
+    production_run_id, _ = legacy.save_production_run(legacy_run_payload())
+
+    upgraded = RuntimeStore(path)
+
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert upgraded.get_production_run("run-000000000001")[
+        "production_run_id"
+    ] == production_run_id
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(asset_manifests)")
+        }
+    assert {
+        "id",
+        "workspace_uri",
+        "content_hash",
+        "file_hash",
+        "source_kind",
+        "created_at",
+    } <= columns
+
+
+def test_runtime_store_upgrades_v4_manifest_binding_to_versioned_history(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=4)
+    production_run_id, _ = legacy.save_production_run(legacy_run_payload())
+    uri = "workspace://assets/77777777-7777-4777-8777-777777777777/manifest.json"
+    file_hash = "sha256:" + "a" * 64
+    legacy.register_workspace_file(
+        uri=uri,
+        relative_path="assets/77777777-7777-4777-8777-777777777777/manifest.json",
+        kind="asset-manifest",
+        content_hash=file_hash,
+        size_bytes=10,
+        media_type="application/json",
+        metadata={},
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO asset_manifests(
+              id, run_id, workspace_uri, content_hash, file_hash,
+              source_kind, created_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                "77777777-7777-4777-8777-777777777777",
+                production_run_id,
+                uri,
+                "sha256:" + "b" * 64,
+                file_hash,
+                "compatibility_empty",
+                "2026-08-15T04:05:00+00:00",
+            ),
+        )
+
+    upgraded = RuntimeStore(path)
+    current = upgraded.get_asset_manifest_for_run("run-000000000001")
+    history = upgraded.list_asset_manifests_for_run("run-000000000001")
+
+    assert current["id"] == "77777777-7777-4777-8777-777777777777"
+    assert current["revision"] == 1
+    assert current["production_run_id"] == production_run_id
+    assert history == [current]
+
+
+def test_runtime_store_upgrades_v5_to_current_with_formal_input_tables(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=5)
+    production_run_id, _ = legacy.save_production_run(legacy_run_payload())
+
+    upgraded = RuntimeStore(path)
+
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert upgraded.get_production_run("run-000000000001")[
+        "production_run_id"
+    ] == production_run_id
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        release_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(frozen_script_releases)"
+            )
+        }
+        request_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(production_requests)"
+            )
+        }
+        applied = {
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM runtime_schema_migrations"
+            )
+        }
+
+    assert {"frozen_script_releases", "production_requests"} <= tables
+    assert {
+        "id",
+        "manifest_uri",
+        "content_uri",
+        "content_hash",
+        "manifest_file_hash",
+    } <= release_columns
+    assert {
+        "id",
+        "idempotency_key",
+        "request_uri",
+        "request_file_hash",
+        "release_id",
+        "run_id",
+    } <= request_columns
+    assert 6 in applied
 
 
 def test_runtime_store_rejects_newer_schema_version(tmp_path):
@@ -102,6 +288,36 @@ def test_runtime_store_rejects_corrupt_database(tmp_path):
 
     assert raised.value.code == "runtime_database_corrupt"
     assert raised.value.status == 500
+
+
+def test_runtime_store_maps_query_errors_after_database_corruption(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    runtime = RuntimeStore(path)
+    path.write_bytes(b"this is not a sqlite database")
+
+    for operation in (
+        runtime.schema_version,
+        lambda: runtime.resolve_production_run_id("run-000000000001"),
+        lambda: runtime.get_attempt("job-000000000001"),
+    ):
+        with pytest.raises(ProductionError) as raised:
+            operation()
+        assert raised.value.code == "runtime_database_corrupt"
+        assert raised.value.status == 500
+
+
+def test_runtime_store_reports_interrupted_migration_without_raw_sqlite_error(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    RuntimeStore(path, target_version=1)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version=0")
+
+    with pytest.raises(ProductionError) as raised:
+        RuntimeStore(path)
+
+    assert raised.value.code == "runtime_database_migration_failed"
+    assert raised.value.status == 500
+    assert raised.value.details == {"version": 1}
 
 
 def test_repository_imports_legacy_run_json_once(tmp_path):
@@ -132,6 +348,85 @@ def test_save_run_preserves_formal_work_item_ids(tmp_path):
     assert same_run_id == production_run_id
     assert second_ids == first_ids
     assert all(uuid.UUID(value) for value in first_ids.values())
+
+
+def test_legacy_run_identity_map_is_persistent_and_supports_canonical_lookup(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(path)
+    payload = legacy_run_payload()
+
+    production_run_id, _ = store.save_production_run(payload)
+    repeated_id, _ = store.save_production_run(dict(payload, updated_at="2026-08-15T00:02:00+00:00"))
+
+    assert repeated_id == production_run_id
+    assert store.resolve_production_run_id(payload["run_id"]) == production_run_id
+    canonical = store.get_production_run(production_run_id)
+    assert canonical is not None
+    assert canonical["run_id"] == payload["run_id"]
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT legacy_run_id, production_run_id, content_hash FROM production_run_identity_map"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == payload["run_id"]
+    assert rows[0][1] == production_run_id
+    assert rows[0][2].startswith("sha256:")
+
+
+def test_same_legacy_run_id_with_different_content_is_a_stable_conflict(tmp_path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    payload = legacy_run_payload()
+    production_run_id, _ = store.save_production_run(payload)
+    conflicting = dict(payload)
+    conflicting["source_summary"] = {"line_count": 2}
+
+    with pytest.raises(ProductionError) as raised:
+        store.save_production_run(conflicting)
+
+    assert raised.value.code == "production_run_identity_conflict"
+    assert raised.value.status == 409
+    assert raised.value.details == {
+        "legacy_run_id": payload["run_id"],
+        "production_run_id": production_run_id,
+    }
+    assert store.get_production_run(payload["run_id"])["source_summary"] == {"line_count": 1}
+
+
+def test_requested_production_run_id_must_be_canonical_and_is_persisted_verbatim(tmp_path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    invalid = dict(legacy_run_payload(), production_run_id="run-not-a-uuid")
+
+    with pytest.raises(ProductionError) as raised:
+        store.save_production_run(invalid)
+
+    assert raised.value.code == "production_run_identity_invalid"
+    assert raised.value.status == 400
+
+    requested = dict(
+        legacy_run_payload(),
+        production_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    production_run_id, _ = store.save_production_run(requested)
+    assert production_run_id == requested["production_run_id"]
+    assert store.resolve_production_run_id(requested["run_id"]) == production_run_id
+
+
+def test_runtime_identity_migration_backfills_existing_production_runs(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=8)
+    payload = legacy_run_payload()
+    production_run_id, _ = legacy.save_production_run(payload)
+
+    upgraded = RuntimeStore(path)
+
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert upgraded.resolve_production_run_id(payload["run_id"]) == production_run_id
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT production_run_id FROM production_run_identity_map WHERE legacy_run_id=?",
+            (payload["run_id"],),
+        ).fetchone()
+    assert row == (production_run_id,)
 
 
 def test_attempt_transitions_emit_canonical_sequenced_events(tmp_path):

@@ -32,6 +32,7 @@ CG_SEGMENT_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/cg-segments/([^
 RUN_RESOURCE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/resources/(characters|backgrounds|cg-backgrounds|sounds|cg)$")
 RUN_CHARACTER_RESOURCE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/resources/characters/([^/]+)$")
 RUN_RESOURCE_USAGE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/resource-usage$")
+RUN_ASSET_MANIFESTS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/asset-manifests$")
 RUN_ASSETS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/assets$")
 RUN_ASSET_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/assets/(asset-[0-9a-f]{12})$")
 RUN_ASSET_VALIDATE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/assets/validate$")
@@ -74,6 +75,12 @@ class ProductionHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._headers(status, len(body))
         self.wfile.write(body)
+
+    def _wants_api_error_v1(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "application/vnd.halocue.api-error+json" in accept and (
+            "version=1.0" in accept or "version=\"1.0\"" in accept
+        )
 
     def _send_asset(self, path: Path) -> None:
         if not path.is_file() or not path.is_relative_to(self.ui_root):
@@ -148,6 +155,8 @@ class ProductionHandler(BaseHTTPRequestHandler):
             return 200, self.service.health()
         if method == "GET" and path == "/api/v1/capabilities":
             return 200, {"ok": True, "capabilities": self.service.capabilities()}
+        if method == "GET" and path == "/api/v1/production-adapters":
+            return 200, self.service.adapter_capabilities()
         if path == "/api/v1/settings/direction-model":
             if method == "GET":
                 return 200, self.service.direction_model_settings_public()
@@ -232,6 +241,14 @@ class ProductionHandler(BaseHTTPRequestHandler):
         match = RUN_RESOURCE_USAGE_ROUTE.fullmatch(path)
         if match and method == "GET":
             return 200, self.service.resource_usage(match.group(1))
+        match = RUN_ASSET_MANIFESTS_ROUTE.fullmatch(path)
+        if match:
+            if method == "GET":
+                return 200, self.service.asset_manifest_history(match.group(1))
+            if method == "POST":
+                return 201, self.service.upgrade_asset_manifest(
+                    match.group(1), self._body()
+                )
         match = RUN_ASSETS_ROUTE.fullmatch(path)
         if match:
             if method == "GET":
@@ -333,13 +350,21 @@ class ProductionHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self._dispatch(method)
         except ProductionError as exc:
-            self._send(exc.status, exc.to_payload())
+            self._send(
+                exc.status,
+                exc.to_api_error_payload()
+                if self._wants_api_error_v1()
+                else exc.to_payload(),
+            )
         except Exception as exc:
+            error = ProductionError(
+                "internal_error", "服务器处理失败", status=500, details={"type": type(exc).__name__}
+            )
             self._send(
                 500,
-                ProductionError(
-                    "internal_error", "服务器处理失败", status=500, details={"type": type(exc).__name__}
-                ).to_payload(),
+                error.to_api_error_payload()
+                if self._wants_api_error_v1()
+                else error.to_payload(),
             )
         else:
             self._send(status, payload)

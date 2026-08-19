@@ -12,6 +12,10 @@ HaloCue 1.0 的本地优先后端仓库。当前采用模块化单体，包含�
 
 ## 外部仓库与本地输入
 
+HaloCue 后端 GitHub 仓库为 [Jianmiao/halocue-backend](https://github.com/Jianmiao/halocue-backend.git)。当前开发分支为 `codex/halocue-b2`；R1 的源码改动应在该仓库中提交和上传。
+
+`https://github.com/SlimeBoyOwO/LingChat.git` 仅对应本地 `D:\StoryForge\LingChat` 的无效源码目录，不是 HaloCue 后端仓库，也不应作为本仓库的上传目标。`F:\LingChat` 仍只作为本地行为和数据参考。
+
 本仓库不跟踪 `01-完整程序/`、`references/` 或原交接包校验清单。它们分别属于 AA 兼容运行依赖、只读逆向/StoryForge 证据和交接归档，不是 HaloCue 的产品源码，也不得随本仓库分发。
 
 当前 AA 兼容测试仍可读取本地 `01-完整程序/aa`。后续应通过明确的外部仓库版本或适配器包提供该依赖，不能把 AA 反编译源码并入 HaloCue。
