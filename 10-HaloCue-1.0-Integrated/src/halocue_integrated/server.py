@@ -39,7 +39,11 @@ class IntegratedRuntime:
         self.production_server = create_production_server(self.production_service, "127.0.0.1", 0)
         production_address = ("127.0.0.1", self.production_server.server_port)
 
-        self.writing_service = WritingService(writing_data_dir, f"http://127.0.0.1:{self.production_server.server_port}")
+        self.writing_service = WritingService(
+            writing_data_dir,
+            f"http://127.0.0.1:{self.production_server.server_port}",
+            public_production_url="/production",
+        )
         writing_handler = make_handler(self.writing_service, WRITING_ROOT / "web")
         self.writing_server = ThreadingHTTPServer(("127.0.0.1", 0), writing_handler)
         writing_address = ("127.0.0.1", self.writing_server.server_port)
@@ -52,29 +56,90 @@ class IntegratedRuntime:
             static_dir=PROJECT_ROOT / "static",
         )
         self._threads = [
-            threading.Thread(target=self.production_server.serve_forever, name="halocue-production", daemon=True),
-            threading.Thread(target=self.writing_server.serve_forever, name="halocue-writing", daemon=True),
+            threading.Thread(
+                target=self._serve_upstream,
+                args=(self.production_server,),
+                name="halocue-production",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._serve_upstream,
+                args=(self.writing_server,),
+                name="halocue-writing",
+                daemon=True,
+            ),
         ]
+        self._upstreams_started = False
+        self._gateway_thread: threading.Thread | None = None
+        self._closed = False
 
     @property
     def port(self) -> int:
         return self.gateway.server_port
 
     def start_upstreams(self) -> None:
+        if self._closed:
+            raise RuntimeError("integrated runtime is closed")
+        if self._upstreams_started:
+            return
         for thread in self._threads:
             thread.start()
+        self._upstreams_started = True
+
+    @staticmethod
+    def _serve_upstream(server: ThreadingHTTPServer) -> None:
+        server.halocue_serving = True
+        try:
+            server.serve_forever()
+        finally:
+            server.halocue_serving = False
+
+    def start(self) -> None:
+        """Start both domain services and the single public gateway."""
+        self.start_upstreams()
+        if self._gateway_thread is None or not self._gateway_thread.is_alive():
+            self._gateway_thread = threading.Thread(
+                target=self.gateway.serve_forever,
+                name="halocue-gateway",
+                daemon=True,
+            )
+            self._gateway_thread.start()
+
+    def serve_forever(self) -> None:
+        """Run the composition root in the foreground for CLI entry points."""
+        self.start_upstreams()
+        try:
+            self.gateway.serve_forever()
+        finally:
+            self.close(stop_gateway=False)
+
+    @staticmethod
+    def _stop_server(server: ThreadingHTTPServer, *, serving: bool) -> None:
+        if serving:
+            server.shutdown()
+        server.server_close()
 
     def close(self, *, stop_gateway: bool = True) -> None:
+        if self._closed:
+            return
         if stop_gateway:
-            self.gateway.shutdown()
-        self.gateway.server_close()
-        self.writing_server.shutdown()
-        self.writing_server.server_close()
-        self.production_server.shutdown()
-        self.production_server.server_close()
+            self._stop_server(self.gateway, serving=self.gateway.halocue_serving)
+        else:
+            self._stop_server(self.gateway, serving=False)
+        self._stop_server(
+            self.writing_server,
+            serving=bool(getattr(self.writing_server, "halocue_serving", False)),
+        )
+        self._stop_server(
+            self.production_server,
+            serving=bool(getattr(self.production_server, "halocue_serving", False)),
+        )
         self.production_service.jobs.close()
         for thread in self._threads:
             thread.join(timeout=3)
+        if self._gateway_thread and self._gateway_thread is not threading.current_thread():
+            self._gateway_thread.join(timeout=3)
+        self._closed = True
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -92,15 +157,12 @@ def main(argv: list[str] | None = None) -> None:
         writing_data_dir=writing_data,
         production_data_dir=production_data,
     )
-    runtime.start_upstreams()
     print(f"HaloCue 1.0: http://{args.host}:{runtime.port}/", flush=True)
     print(f"AA production: http://{args.host}:{runtime.port}/production/", flush=True)
     try:
-        runtime.gateway.serve_forever()
+        runtime.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        runtime.close(stop_gateway=False)
+        runtime.close()
 
 
 if __name__ == "__main__":

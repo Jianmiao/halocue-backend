@@ -119,10 +119,17 @@ class ProductionHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self) -> dict[str, Any]:
+        if self.headers.get("Transfer-Encoding"):
+            raise ProductionError(
+                "unsupported_transfer_encoding",
+                "当前服务只接受带 Content-Length 的请求",
+            )
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError as exc:
             raise ProductionError("invalid_content_length", "请求长度无效") from exc
+        if length < 0:
+            raise ProductionError("invalid_content_length", "请求长度无效")
         if length > 6 * 1024 * 1024:
             raise ProductionError("request_too_large", "请求不能超过 6 MiB", status=413)
         try:
@@ -134,6 +141,11 @@ class ProductionHandler(BaseHTTPRequestHandler):
         return value
 
     def _upload(self) -> tuple[str, bytes]:
+        if self.headers.get("Transfer-Encoding"):
+            raise ProductionError(
+                "unsupported_transfer_encoding",
+                "当前服务只接受带 Content-Length 的请求",
+            )
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError as exc:
