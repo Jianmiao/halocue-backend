@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +19,8 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+MAX_PROXY_BODY_BYTES = 64 * 1024 * 1024
+API_ERROR_MEDIA_TYPE = "application/vnd.halocue.api-error+json"
 
 
 def _path_is(path: str, prefix: str) -> bool:
@@ -64,6 +67,47 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _wants_api_error_v1(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return API_ERROR_MEDIA_TYPE in accept and (
+            "version=1.0" in accept or 'version="1.0"' in accept
+        )
+
+    def _send_gateway_error(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        target: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self._wants_api_error_v1():
+            payload = {
+                "schema_version": "1.0",
+                "code": code.upper(),
+                "category": "environment" if status >= 500 else "validation",
+                "message": message,
+                "detail_ref": None,
+                "retryability": "automatic" if status in {502, 503, 504} else "never",
+                "scope_refs": [],
+                "caused_by_attempt": None,
+            }
+            content_type = f"{API_ERROR_MEDIA_TYPE}; version=1.0"
+        else:
+            legacy_details = details if details is not None else ({"target": target} if target else {})
+            payload = {"ok": False, "error": {"code": code, "message": message, "details": legacy_details}}
+            content_type = "application/json; charset=utf-8"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(body)
 
@@ -149,9 +193,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
         target, downstream_path = route_request(routed_path, self.headers.get("Referer"))
         address = self.production_address if target == "production" else self.writing_address
         try:
+            if self.headers.get("Transfer-Encoding"):
+                self._send_gateway_error(
+                    400,
+                    "unsupported_transfer_encoding",
+                    "网关只接受带 Content-Length 的请求。",
+                )
+                return
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            self.send_error(400, "Invalid Content-Length")
+            self._send_gateway_error(400, "invalid_content_length", "请求长度无效。")
+            return
+        if length < 0:
+            self._send_gateway_error(400, "invalid_content_length", "请求长度无效。")
+            return
+        if length > MAX_PROXY_BODY_BYTES:
+            self._send_gateway_error(413, "payload_too_large", "请求内容过大。")
             return
         body = self.rfile.read(length) if length else None
         headers = {
@@ -178,13 +235,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_header("X-Frame-Options", "DENY")
             self.end_headers()
             self.wfile.write(response_body)
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            payload = (f'{{"ok":false,"error":{{"code":"upstream_unavailable","message":"{target} service unavailable","details":{{"type":"{type(exc).__name__}"}}}}}}').encode("utf-8")
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+        except (ConnectionError, TimeoutError, OSError, http.client.HTTPException) as exc:
+            self._send_gateway_error(
+                503,
+                "upstream_unavailable",
+                f"{target} service unavailable",
+                target=target,
+                details={"type": type(exc).__name__},
+            )
         finally:
             connection.close()
 
@@ -195,6 +253,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
     do_DELETE = _proxy
 
 
+class IntegratedHTTPServer(ThreadingHTTPServer):
+    """Gateway server with an explicit lifecycle flag for safe shutdown."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.halocue_serving = False
+
+    def serve_forever(self, *args: Any, **kwargs: Any) -> None:
+        self.halocue_serving = True
+        try:
+            super().serve_forever(*args, **kwargs)
+        finally:
+            self.halocue_serving = False
+
+
 def create_gateway(
     host: str,
     port: int,
@@ -202,7 +275,7 @@ def create_gateway(
     writing_address: tuple[str, int],
     production_address: tuple[str, int],
     static_dir: Path,
-) -> ThreadingHTTPServer:
+) -> IntegratedHTTPServer:
     handler = type(
         "BoundGatewayHandler",
         (GatewayHandler,),
@@ -212,4 +285,4 @@ def create_gateway(
             "static_dir": static_dir.resolve(),
         },
     )
-    return ThreadingHTTPServer((host, port), handler)
+    return IntegratedHTTPServer((host, port), handler)

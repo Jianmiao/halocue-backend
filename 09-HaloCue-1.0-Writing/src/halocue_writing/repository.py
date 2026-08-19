@@ -10,6 +10,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .errors import DomainError
+
+
+WRITING_SCHEMA_VERSION = 2
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -46,10 +51,14 @@ class Repository:
         self.recover_attempts()
 
     def connect(self):
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection = sqlite3.connect(self.db_path, timeout=5)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            return connection
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise self._database_error(exc) from exc
 
     @contextmanager
     def transaction(self):
@@ -66,6 +75,9 @@ class Repository:
 
     def _init_schema(self):
         schema = """
+        CREATE TABLE IF NOT EXISTS writing_schema_migrations (
+          version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS works (
           id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
           version INTEGER NOT NULL, active_writing_pack_version TEXT NOT NULL,
@@ -230,9 +242,79 @@ class Repository:
         CREATE INDEX IF NOT EXISTS idx_authorization_thread ON authorization_policies(thread_id, status);
         CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback_reports(status, created_at);
         """
-        with self.connect() as connection:
-            connection.executescript(schema)
-            self._migrate_domain_schema(connection)
+        try:
+            with self.connect() as connection:
+                current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if current > WRITING_SCHEMA_VERSION:
+                    raise DomainError(
+                        "writing_database_version_unsupported",
+                        "写作数据库来自更新版本，当前程序无法打开。",
+                        status=409,
+                        details={
+                            "received": current,
+                            "supported": WRITING_SCHEMA_VERSION,
+                        },
+                    )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS writing_schema_migrations "
+                    "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                )
+                if current < 1:
+                    try:
+                        connection.executescript(schema)
+                        connection.execute(
+                            "INSERT OR IGNORE INTO writing_schema_migrations(version, applied_at) VALUES(?, ?)",
+                            (1, now()),
+                        )
+                        connection.execute("PRAGMA user_version = 1")
+                    except (sqlite3.DatabaseError, OSError) as exc:
+                        raise self._migration_error(1, exc) from exc
+                    current = 1
+                if current < 2:
+                    try:
+                        self._migrate_domain_schema(connection)
+                        connection.execute(
+                            "INSERT OR IGNORE INTO writing_schema_migrations(version, applied_at) VALUES(?, ?)",
+                            (2, now()),
+                        )
+                        connection.execute("PRAGMA user_version = 2")
+                    except (sqlite3.DatabaseError, OSError) as exc:
+                        raise self._migration_error(2, exc) from exc
+                check = connection.execute("PRAGMA quick_check").fetchone()
+                if not check or str(check[0]).casefold() != "ok":
+                    raise DomainError(
+                        "writing_database_corrupt",
+                        "写作数据库完整性检查失败，请从备份恢复或联系支持。",
+                        status=500,
+                    )
+        except DomainError:
+            raise
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise self._database_error(exc) from exc
+
+    @staticmethod
+    def _database_error(exc: Exception) -> DomainError:
+        return DomainError(
+            "writing_database_corrupt",
+            "写作数据库无法读取，请从备份恢复或联系支持。",
+            status=500,
+        )
+
+    @staticmethod
+    def _migration_error(version: int, exc: Exception) -> DomainError:
+        return DomainError(
+            "writing_database_migration_failed",
+            "写作数据库升级失败，请从备份恢复或联系支持。",
+            status=500,
+            details={"version": int(version)},
+        )
+
+    def schema_version(self) -> int:
+        try:
+            with self.connect() as connection:
+                return int(connection.execute("PRAGMA user_version").fetchone()[0])
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise self._database_error(exc) from exc
 
     def _migrate_domain_schema(self, connection):
         """Add durable writing-domain fields without replacing an existing workspace."""

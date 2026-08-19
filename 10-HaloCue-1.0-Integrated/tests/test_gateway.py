@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+import http.client
 import sys
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +21,7 @@ for source_root in (
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
 
-from halocue_integrated.gateway import route_request
+from halocue_integrated.gateway import MAX_PROXY_BODY_BYTES, create_gateway, route_request
 from halocue_integrated.server import IntegratedRuntime
 
 
@@ -169,3 +174,69 @@ def test_script_release_crosses_the_real_writing_production_boundary(
     assert origin["work_id"] == work["id"]
     assert origin["writing_pack_version"] == frozen["manifest"]["writing_pack_version"]
     assert production["run"]["release_id"] != frozen["release_id"]
+
+
+def test_integrated_runtime_lifecycle_and_internal_endpoint_redaction(tmp_path, monkeypatch):
+    _isolate_optional_local_assets(monkeypatch, tmp_path)
+    runtime = IntegratedRuntime(
+        host="127.0.0.1",
+        port=0,
+        writing_data_dir=tmp_path / "writing",
+        production_data_dir=tmp_path / "production",
+    )
+    internal_port = runtime.production_server.server_port
+    runtime.start()
+    runtime.start_upstreams()
+    diagnostics = runtime.writing_service.system_diagnostics()
+    try:
+        assert diagnostics["production_service"]["url"] == "/production"
+        assert str(internal_port) not in json.dumps(diagnostics, ensure_ascii=False)
+    finally:
+        runtime.close()
+        runtime.close()
+
+
+def test_gateway_errors_keep_legacy_wrapper_and_negotiate_api_error(tmp_path):
+    gateway = create_gateway(
+        "127.0.0.1",
+        0,
+        writing_address=("127.0.0.1", 1),
+        production_address=("127.0.0.1", 1),
+        static_dir=tmp_path,
+    )
+    thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{gateway.server_port}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as legacy_error:
+            urllib.request.urlopen(base + "/api/v1/health", timeout=5)
+        legacy = json.loads(legacy_error.value.read().decode("utf-8"))
+        assert legacy["ok"] is False
+        assert legacy["error"]["code"] == "upstream_unavailable"
+
+        request = urllib.request.Request(
+            base + "/api/v1/health",
+            headers={"Accept": "application/vnd.halocue.api-error+json; version=1.0"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as negotiated_error:
+            urllib.request.urlopen(request, timeout=5)
+        negotiated = json.loads(negotiated_error.value.read().decode("utf-8"))
+        assert negotiated["schema_version"] == "1.0"
+        assert negotiated["code"] == "UPSTREAM_UNAVAILABLE"
+        assert "ok" not in negotiated
+
+        connection = http.client.HTTPConnection("127.0.0.1", gateway.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/api/v1/health",
+            body=b"",
+            headers={"Content-Length": str(MAX_PROXY_BODY_BYTES + 1)},
+        )
+        oversized = connection.getresponse()
+        oversized_payload = json.loads(oversized.read().decode("utf-8"))
+        assert oversized.status == 413
+        assert oversized_payload["error"]["code"] == "payload_too_large"
+    finally:
+        gateway.shutdown()
+        gateway.server_close()
+        thread.join(timeout=3)

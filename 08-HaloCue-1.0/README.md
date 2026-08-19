@@ -159,6 +159,10 @@ formal error contract may send
 direct `ApiError/1.0` object. The negotiated view never includes raw exception
 details, local paths, credentials, or private source text.
 
+Product decision: keep this negotiation mode and the legacy wrapper as the
+default compatibility behavior for now. Reconsider making `ApiError/1.0` the
+default only after the frontend and all other callers have completed migration.
+
 The service binds to `127.0.0.1` by default and sends restrictive local-app
 security headers. Source text is accepted only in request bodies; arbitrary
 client filesystem paths are not accepted by this first slice.

@@ -31,8 +31,23 @@ python -m halocue_integrated.server --port 8910
 The default runtime reuses the existing durable data directories in `08` and
 `09`. Use `--writing-data-dir` and `--production-data-dir` for isolated QA.
 
+`IntegratedRuntime.start()` starts both private domain servers and the public
+gateway. `serve_forever()` is the CLI foreground entry point; `close()` is
+idempotent and safely handles a runtime that was never started. The writing
+service uses the private production address for the handoff, but diagnostics
+expose only the public `/production` route.
+
+The writing database records schema versions in `PRAGMA user_version` and
+`writing_schema_migrations`. A newer or corrupt database stops startup with a
+stable domain error instead of silently rebuilding the workspace.
+
 ## Current model boundary
 
 The writing Provider is still the visibly labelled Fake Provider. This
 integration does not claim that real model calls, token accounting, automatic
 canon maintenance, or a distributable `ba-writing` WritingPack are complete.
+
+HTTP compatibility remains explicit: both domain handlers and the Gateway
+return the legacy error wrapper by default. A client must send
+`Accept: application/vnd.halocue.api-error+json; version=1.0` to receive the
+formal `ApiError/1.0` object.

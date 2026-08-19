@@ -22,12 +22,21 @@ PRODUCTION_HANDOFF_TIMEOUT_SECONDS = 30
 
 
 class WritingService:
-    def __init__(self, data_dir: Path, production_url: str = "http://127.0.0.1:8892", official_corpus_dir: Path | None = None):
+    def __init__(
+        self,
+        data_dir: Path,
+        production_url: str = "http://127.0.0.1:8892",
+        official_corpus_dir: Path | None = None,
+        public_production_url: str | None = None,
+    ):
         self.repo = Repository(data_dir)
         self.model_settings = WritingModelSettings(data_dir)
         self.preferences = UserPreferencesStore(data_dir)
         self.provider = make_writing_provider(self.model_settings)
         self.production_url = production_url.rstrip("/")
+        self.public_production_url = (
+            (public_production_url or self.production_url).rstrip("/")
+        )
         configured_corpus = official_corpus_dir or os.environ.get("HALOCUE_BA_CORPUS_DIR")
         if configured_corpus:
             corpus_dir = Path(configured_corpus)
@@ -2990,10 +2999,18 @@ class WritingService:
                 str(error.get("code") or "production_rejected"),
                 str(error.get("message") or "AA 制作后端拒绝了这份发布版本。"),
                 status=exc.code,
-                details={"upstream": error.get("details", {}), "url": self.production_url},
+                details={
+                    "upstream_code": str(error.get("code") or "production_rejected"),
+                    "url": self.public_production_url,
+                },
             ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise DomainError("production_unavailable", "AA 制作后端当前不可用，发布版本仍安全保留。", status=503, details={"url": self.production_url, "reason": str(exc)}) from exc
+            raise DomainError(
+                "production_unavailable",
+                "AA 制作后端当前不可用，发布版本仍安全保留。",
+                status=503,
+                details={"url": self.public_production_url},
+            ) from exc
         run_id = (
             result.get("run_id")
             or result.get("id")
@@ -3001,7 +3018,12 @@ class WritingService:
             or result.get("production_run", {}).get("id")
         )
         if not run_id:
-            raise DomainError("production_contract_error", "制作后端未返回 ProductionRun ID。", status=502, details={"response": result})
+            raise DomainError(
+                "production_contract_error",
+                "制作后端未返回 ProductionRun ID。",
+                status=502,
+                details={"response_keys": sorted(result) if isinstance(result, dict) else []},
+            )
         with self.repo.transaction() as connection:
             connection.execute("UPDATE script_releases SET production_run_id=? WHERE id=?", (run_id, release_id))
         return {"release_id": release_id, "production_run_id": run_id, "response": result}
@@ -3077,7 +3099,7 @@ class WritingService:
             },
             "production_service": {
                 "status": "online" if prod_health else "offline",
-                "url": self.production_url,
+                "url": self.public_production_url,
             },
             "corpus_status": {
                 "available": self.official_references.available,
