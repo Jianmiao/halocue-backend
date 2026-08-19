@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from pathlib import Path
 
 from .errors import ProductionError
@@ -51,9 +52,18 @@ class ProductionRepository:
                 item.work_item_id = work_item_ids[item.key]
 
     def get_run(self, run_id: str) -> ProductionRun:
-        if not self._RUN_ID.fullmatch(str(run_id)):
+        identifier = str(run_id)
+        is_legacy = self._RUN_ID.fullmatch(identifier) is not None
+        is_canonical = False
+        if not is_legacy:
+            try:
+                parsed = uuid.UUID(identifier)
+                is_canonical = str(parsed) == identifier
+            except (AttributeError, ValueError):
+                is_canonical = False
+        if not is_legacy and not is_canonical:
             raise ProductionError("invalid_run_id", "制作任务 ID 无效", status=400)
-        value = self.runtime.get_production_run(run_id)
+        value = self.runtime.get_production_run(identifier)
         if value is None:
             raise ProductionError("run_not_found", "制作任务不存在", status=404)
         try:

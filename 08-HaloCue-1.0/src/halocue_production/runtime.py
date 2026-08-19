@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from .errors import ProductionError
 
 
-RUNTIME_SCHEMA_VERSION = 8
+RUNTIME_SCHEMA_VERSION = 9
 _RUNTIME_NAMESPACE = uuid.UUID("1e07ec7a-bc62-4b64-97fd-d8ec8764dc46")
 _ACTIVE_ATTEMPT_STATES = frozenset({"queued", "running", "started"})
 
@@ -303,6 +303,19 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX idx_formal_performance_drafts_head ON formal_performance_drafts(draft_id, created_at)",
         "CREATE INDEX idx_formal_performance_drafts_request ON formal_performance_drafts(request_id)",
     ),
+    9: (
+        """
+        CREATE TABLE production_run_identity_map (
+          legacy_run_id TEXT PRIMARY KEY,
+          production_run_id TEXT NOT NULL UNIQUE,
+          content_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(production_run_id) REFERENCES production_runs(id)
+        )
+        """,
+        "CREATE INDEX idx_production_run_identity_map_production ON production_run_identity_map(production_run_id)",
+    ),
 }
 
 
@@ -327,6 +340,38 @@ def _json_value(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except (TypeError, ValueError, json.JSONDecodeError):
         return default
+
+
+def production_run_identity_hash(payload: dict[str, Any]) -> str:
+    """Hash only the immutable source identity, excluding runtime state."""
+    work_items = []
+    for item in payload.get("work_items") or []:
+        if not isinstance(item, dict):
+            continue
+        work_items.append(
+            {
+                "key": str(item.get("key") or ""),
+                "label": str(item.get("label") or ""),
+            }
+        )
+    envelope = {
+        "project": str(payload.get("project") or ""),
+        "release_id": str(payload.get("release_id") or ""),
+        "source_summary": payload.get("source_summary") or {},
+        "work_items": work_items,
+    }
+    return "sha256:" + hashlib.sha256(_json(envelope).encode("utf-8")).hexdigest()
+
+
+def _canonical_uuid(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = uuid.UUID(text)
+    except (AttributeError, ValueError):
+        return None
+    return text if str(parsed) == text else None
 
 
 def production_run_uuid(legacy_run_id: str) -> str:
@@ -364,6 +409,9 @@ class RuntimeStore:
         if target_version < 1 or target_version > RUNTIME_SCHEMA_VERSION:
             raise ValueError("unsupported runtime schema target")
         self._migrate(target_version)
+        self._identity_map_enabled = self.schema_version() >= 9
+        if self._identity_map_enabled:
+            self._backfill_production_run_identity_map()
         self._verify()
 
     @staticmethod
@@ -450,12 +498,64 @@ class RuntimeStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _run_row(
+        connection: sqlite3.Connection, identifier: str
+    ) -> sqlite3.Row | None:
+        column = "id" if _canonical_uuid(identifier) else "legacy_run_id"
+        return connection.execute(
+            f"SELECT id, legacy_run_id FROM production_runs WHERE {column}=?",
+            (str(identifier),),
+        ).fetchone()
+
     def schema_version(self) -> int:
         connection = self._connect()
         try:
             return int(connection.execute("PRAGMA user_version").fetchone()[0])
         finally:
             connection.close()
+
+    @staticmethod
+    def _identity_payload_from_row(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        work_items = connection.execute(
+            "SELECT legacy_key, label FROM work_items WHERE run_id=? ORDER BY ordinal, id",
+            (str(row["id"]),),
+        ).fetchall()
+        return {
+            "project": str(row["project"]),
+            "release_id": str(row["release_id"]),
+            "source_summary": _json_value(row["source_summary_json"], {}),
+            "work_items": [
+                {"key": str(item["legacy_key"] or ""), "label": str(item["label"] or "")}
+                for item in work_items
+            ],
+        }
+
+    def _backfill_production_run_identity_map(self) -> None:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT id, legacy_run_id, project, release_id, source_summary_json, created_at, updated_at FROM production_runs"
+            ).fetchall()
+            for row in rows:
+                content_hash = production_run_identity_hash(
+                    self._identity_payload_from_row(connection, row)
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO production_run_identity_map(
+                      legacy_run_id, production_run_id, content_hash, created_at, updated_at
+                    ) VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        str(row["legacy_run_id"]),
+                        str(row["id"]),
+                        content_hash,
+                        str(row["created_at"]),
+                        str(row["updated_at"]),
+                    ),
+                )
 
     @staticmethod
     def _workspace_file_payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -1062,10 +1162,7 @@ class RuntimeStore:
         created_at: str,
     ) -> dict[str, Any]:
         with self._transaction() as connection:
-            run = connection.execute(
-                "SELECT id FROM production_runs WHERE legacy_run_id=?",
-                (legacy_run_id,),
-            ).fetchone()
+            run = self._run_row(connection, legacy_run_id)
             if run is None:
                 raise ProductionError("run_not_found", "制作任务不存在", status=404)
             production_run_id = str(run["id"])
@@ -1144,10 +1241,7 @@ class RuntimeStore:
     ) -> dict[str, Any]:
         selected_at = _now()
         with self._transaction() as connection:
-            run = connection.execute(
-                "SELECT id FROM production_runs WHERE legacy_run_id=?",
-                (legacy_run_id,),
-            ).fetchone()
+            run = self._run_row(connection, legacy_run_id)
             if run is None:
                 raise ProductionError("run_not_found", "制作任务不存在", status=404)
             production_run_id = str(run["id"])
@@ -1255,9 +1349,12 @@ class RuntimeStore:
                 JOIN asset_manifests AS manifests ON manifests.id=heads.manifest_id
                 JOIN production_run_asset_manifest_history AS history
                   ON history.run_id=heads.run_id AND history.ordinal=heads.ordinal
-                WHERE runs.legacy_run_id=?
+                WHERE runs.id=(
+                  SELECT id FROM production_runs
+                  WHERE id=? OR legacy_run_id=?
+                )
                 """,
-                (legacy_run_id,),
+                (legacy_run_id, legacy_run_id),
             ).fetchone()
             return self._asset_manifest_payload(row) if row else None
         except sqlite3.DatabaseError as exc:
@@ -1279,10 +1376,13 @@ class RuntimeStore:
                 FROM production_run_asset_manifest_history AS history
                 JOIN production_runs AS runs ON runs.id=history.run_id
                 JOIN asset_manifests AS manifests ON manifests.id=history.manifest_id
-                WHERE runs.legacy_run_id=?
+                WHERE runs.id=(
+                  SELECT id FROM production_runs
+                  WHERE id=? OR legacy_run_id=?
+                )
                 ORDER BY history.ordinal
                 """,
-                (legacy_run_id,),
+                (legacy_run_id, legacy_run_id),
             ).fetchall()
             return [self._asset_manifest_payload(row) for row in rows]
         except sqlite3.DatabaseError as exc:
@@ -1488,10 +1588,7 @@ class RuntimeStore:
                     status=409,
                     details={"request_id": request_id},
                 )
-            run = connection.execute(
-                "SELECT id FROM production_runs WHERE legacy_run_id=?",
-                (legacy_run_id,),
-            ).fetchone()
+            run = self._run_row(connection, legacy_run_id)
             if run is None:
                 raise ProductionError("run_not_found", "制作任务不存在", status=404)
             production_run_id = str(run["id"])
@@ -1599,14 +1696,17 @@ class RuntimeStore:
     ) -> dict[str, Any] | None:
         connection = self._connect()
         try:
+            run = self._run_row(connection, legacy_run_id)
+            if run is None:
+                return None
             row = connection.execute(
                 """
                 SELECT requests.*, runs.legacy_run_id
                 FROM production_requests AS requests
                 JOIN production_runs AS runs ON runs.id=requests.run_id
-                WHERE runs.legacy_run_id=?
+                WHERE runs.id=?
                 """,
-                (legacy_run_id,),
+                (str(run["id"]),),
             ).fetchone()
             return self._production_request_payload(row) if row else None
         except sqlite3.DatabaseError as exc:
@@ -1619,16 +1719,102 @@ class RuntimeStore:
     ) -> tuple[str, dict[str, str]]:
         legacy_run_id = str(payload["run_id"])
         requested_id = str(payload.get("production_run_id") or "").strip()
+        if requested_id and _canonical_uuid(requested_id) is None:
+            raise ProductionError(
+                "production_run_identity_invalid",
+                "ProductionRun UUID 必须是 canonical UUID",
+                status=400,
+            )
         now = str(payload.get("updated_at") or _now())
+        identity_hash = production_run_identity_hash(payload)
         work_item_ids: dict[str, str] = {}
         with self._transaction() as connection:
             existing = connection.execute(
-                "SELECT id FROM production_runs WHERE legacy_run_id=?",
+                "SELECT * FROM production_runs WHERE legacy_run_id=?",
                 (legacy_run_id,),
             ).fetchone()
-            run_id = str(existing["id"]) if existing else (
-                requested_id or production_run_uuid(legacy_run_id)
-            )
+            identity = None
+            if self._identity_map_enabled:
+                identity = connection.execute(
+                    "SELECT * FROM production_run_identity_map WHERE legacy_run_id=?",
+                    (legacy_run_id,),
+                ).fetchone()
+                if identity is not None and existing is None:
+                    raise ProductionError(
+                        "runtime_identity_corrupt",
+                        "ProductionRun 身份映射缺少对应实体",
+                        status=500,
+                        details={"legacy_run_id": legacy_run_id},
+                    )
+            if identity is not None:
+                run_id = str(identity["production_run_id"])
+                if str(identity["content_hash"]) != identity_hash:
+                    raise ProductionError(
+                        "production_run_identity_conflict",
+                        "同一兼容 Run ID 已绑定不同内容，已拒绝覆盖",
+                        status=409,
+                        details={
+                            "legacy_run_id": legacy_run_id,
+                            "production_run_id": run_id,
+                        },
+                    )
+                if requested_id and requested_id != run_id:
+                    raise ProductionError(
+                        "production_run_identity_conflict",
+                        "同一兼容 Run ID 已绑定其他 ProductionRun UUID",
+                        status=409,
+                        details={
+                            "legacy_run_id": legacy_run_id,
+                            "production_run_id": run_id,
+                            "requested_production_run_id": requested_id,
+                        },
+                    )
+            elif existing is not None:
+                run_id = str(existing["id"])
+                if self._identity_map_enabled:
+                    existing_hash = production_run_identity_hash(
+                        self._identity_payload_from_row(connection, existing)
+                    )
+                    if existing_hash != identity_hash:
+                        raise ProductionError(
+                            "production_run_identity_conflict",
+                            "同一兼容 Run ID 已绑定不同内容，已拒绝覆盖",
+                            status=409,
+                            details={
+                                "legacy_run_id": legacy_run_id,
+                                "production_run_id": run_id,
+                            },
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO production_run_identity_map(
+                          legacy_run_id, production_run_id, content_hash, created_at, updated_at
+                        ) VALUES(?,?,?,?,?)
+                        """,
+                        (
+                            legacy_run_id,
+                            run_id,
+                            identity_hash,
+                            str(existing["created_at"]),
+                            now,
+                        ),
+                    )
+            else:
+                run_id = requested_id or production_run_uuid(legacy_run_id)
+                owner = connection.execute(
+                    "SELECT legacy_run_id FROM production_runs WHERE id=?",
+                    (run_id,),
+                ).fetchone()
+                if owner is not None and str(owner["legacy_run_id"]) != legacy_run_id:
+                    raise ProductionError(
+                        "production_run_identity_conflict",
+                        "ProductionRun UUID 已绑定其他兼容 Run ID",
+                        status=409,
+                        details={
+                            "legacy_run_id": legacy_run_id,
+                            "production_run_id": run_id,
+                        },
+                    )
             connection.execute(
                 """
                 INSERT INTO production_runs(
@@ -1668,6 +1854,21 @@ class RuntimeStore:
                     now,
                 ),
             )
+            if self._identity_map_enabled and identity is None and existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO production_run_identity_map(
+                      legacy_run_id, production_run_id, content_hash, created_at, updated_at
+                    ) VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        legacy_run_id,
+                        run_id,
+                        identity_hash,
+                        str(payload["created_at"]),
+                        now,
+                    ),
+                )
             for ordinal, item in enumerate(payload.get("work_items") or []):
                 key = str(item["key"])
                 work_item_id = str(item.get("work_item_id") or "").strip()
@@ -1742,12 +1943,13 @@ class RuntimeStore:
             "last_installed_project": row["last_installed_project"],
         }
 
-    def get_production_run(self, legacy_run_id: str) -> dict[str, Any] | None:
+    def get_production_run(self, identifier: str) -> dict[str, Any] | None:
         connection = self._connect()
         try:
+            column = "id" if _canonical_uuid(identifier) else "legacy_run_id"
             row = connection.execute(
-                "SELECT * FROM production_runs WHERE legacy_run_id=?",
-                (legacy_run_id,),
+                f"SELECT * FROM production_runs WHERE {column}=?",
+                (str(identifier),),
             ).fetchone()
             return self._run_payload(connection, row) if row else None
         except sqlite3.DatabaseError as exc:
@@ -1767,11 +1969,17 @@ class RuntimeStore:
         finally:
             connection.close()
 
-    def production_run_id(self, legacy_run_id: str | None) -> str | None:
+    def resolve_production_run_id(self, legacy_run_id: str | None) -> str | None:
         if not legacy_run_id:
             return None
         connection = self._connect()
         try:
+            if self._identity_map_enabled:
+                row = connection.execute(
+                    "SELECT production_run_id FROM production_run_identity_map WHERE legacy_run_id=?",
+                    (legacy_run_id,),
+                ).fetchone()
+                return str(row["production_run_id"]) if row else None
             row = connection.execute(
                 "SELECT id FROM production_runs WHERE legacy_run_id=?",
                 (legacy_run_id,),
@@ -1779,6 +1987,10 @@ class RuntimeStore:
             return str(row["id"]) if row else None
         finally:
             connection.close()
+
+    def production_run_id(self, legacy_run_id: str | None) -> str | None:
+        """Compatibility alias for callers using the pre-R1 method name."""
+        return self.resolve_production_run_id(legacy_run_id)
 
     @staticmethod
     def request_digest(
@@ -1841,10 +2053,7 @@ class RuntimeStore:
         with self._transaction() as connection:
             run_id = None
             if legacy_run_id:
-                row = connection.execute(
-                    "SELECT id FROM production_runs WHERE legacy_run_id=?",
-                    (legacy_run_id,),
-                ).fetchone()
+                row = self._run_row(connection, legacy_run_id)
                 run_id = str(row["id"]) if row else None
             if work_item_id:
                 work_item = connection.execute(
@@ -1941,10 +2150,7 @@ class RuntimeStore:
         with self._transaction() as connection:
             run_id = None
             if legacy_run_id:
-                row = connection.execute(
-                    "SELECT id FROM production_runs WHERE legacy_run_id=?",
-                    (legacy_run_id,),
-                ).fetchone()
+                row = self._run_row(connection, legacy_run_id)
                 run_id = str(row["id"]) if row else None
             work_item_id = str(uuid.uuid4())
             attempt_id = str(uuid.uuid4())

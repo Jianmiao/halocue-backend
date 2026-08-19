@@ -152,6 +152,30 @@ def test_http_vertical_slice_and_error_contract(settings):
         assert listing["items"][0]["run_id"] == run_id
 
 
+def test_http_accepts_canonical_production_run_uuid_as_a_compatibility_alias(settings):
+    with api(settings) as base:
+        status, _, created = request(
+            base,
+            "/api/v1/production-runs",
+            {
+                "project": "canonical 查询",
+                "source": {"kind": "inline", "text": "旁白: 测试\n"},
+            },
+            "POST",
+        )
+        assert status == 201
+        canonical_id = created["run"]["production_run_id"]
+        legacy_id = created["run"]["run_id"]
+
+        status, _, detail = request(
+            base, f"/api/v1/production-runs/{canonical_id}"
+        )
+
+    assert status == 200
+    assert detail["run"]["production_run_id"] == canonical_id
+    assert detail["run"]["run_id"] == legacy_id
+
+
 def test_http_writing_release_handoff_returns_existing_run_on_retry(settings):
     text = "## 场景 01\n爱丽丝: 我们开始吧。\n"
     payload = {

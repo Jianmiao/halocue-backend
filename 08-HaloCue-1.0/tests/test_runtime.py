@@ -61,6 +61,7 @@ def test_runtime_store_creates_current_schema(tmp_path):
     assert {
         "runtime_schema_migrations",
         "production_runs",
+        "production_run_identity_map",
         "work_items",
         "job_attempts",
         "production_events",
@@ -317,6 +318,85 @@ def test_save_run_preserves_formal_work_item_ids(tmp_path):
     assert same_run_id == production_run_id
     assert second_ids == first_ids
     assert all(uuid.UUID(value) for value in first_ids.values())
+
+
+def test_legacy_run_identity_map_is_persistent_and_supports_canonical_lookup(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(path)
+    payload = legacy_run_payload()
+
+    production_run_id, _ = store.save_production_run(payload)
+    repeated_id, _ = store.save_production_run(dict(payload, updated_at="2026-08-15T00:02:00+00:00"))
+
+    assert repeated_id == production_run_id
+    assert store.resolve_production_run_id(payload["run_id"]) == production_run_id
+    canonical = store.get_production_run(production_run_id)
+    assert canonical is not None
+    assert canonical["run_id"] == payload["run_id"]
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT legacy_run_id, production_run_id, content_hash FROM production_run_identity_map"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == payload["run_id"]
+    assert rows[0][1] == production_run_id
+    assert rows[0][2].startswith("sha256:")
+
+
+def test_same_legacy_run_id_with_different_content_is_a_stable_conflict(tmp_path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    payload = legacy_run_payload()
+    production_run_id, _ = store.save_production_run(payload)
+    conflicting = dict(payload)
+    conflicting["source_summary"] = {"line_count": 2}
+
+    with pytest.raises(ProductionError) as raised:
+        store.save_production_run(conflicting)
+
+    assert raised.value.code == "production_run_identity_conflict"
+    assert raised.value.status == 409
+    assert raised.value.details == {
+        "legacy_run_id": payload["run_id"],
+        "production_run_id": production_run_id,
+    }
+    assert store.get_production_run(payload["run_id"])["source_summary"] == {"line_count": 1}
+
+
+def test_requested_production_run_id_must_be_canonical_and_is_persisted_verbatim(tmp_path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    invalid = dict(legacy_run_payload(), production_run_id="run-not-a-uuid")
+
+    with pytest.raises(ProductionError) as raised:
+        store.save_production_run(invalid)
+
+    assert raised.value.code == "production_run_identity_invalid"
+    assert raised.value.status == 400
+
+    requested = dict(
+        legacy_run_payload(),
+        production_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    production_run_id, _ = store.save_production_run(requested)
+    assert production_run_id == requested["production_run_id"]
+    assert store.resolve_production_run_id(requested["run_id"]) == production_run_id
+
+
+def test_runtime_identity_migration_backfills_existing_production_runs(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    legacy = RuntimeStore(path, target_version=8)
+    payload = legacy_run_payload()
+    production_run_id, _ = legacy.save_production_run(payload)
+
+    upgraded = RuntimeStore(path)
+
+    assert upgraded.schema_version() == RUNTIME_SCHEMA_VERSION
+    assert upgraded.resolve_production_run_id(payload["run_id"]) == production_run_id
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT production_run_id FROM production_run_identity_map WHERE legacy_run_id=?",
+            (payload["run_id"],),
+        ).fetchone()
+    assert row == (production_run_id,)
 
 
 def test_attempt_transitions_emit_canonical_sequenced_events(tmp_path):

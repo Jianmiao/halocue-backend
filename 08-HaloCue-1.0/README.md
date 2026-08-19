@@ -47,6 +47,13 @@ uses tracked, transactional migrations. Existing `data/runs/*.json` and
 `data/jobs/*.json` files are read only as one-way migration inputs; new state is
 not written back to those files.
 
+Legacy `run-xxxxxxxxxxxx` identifiers remain compatibility aliases. The runtime
+persists each alias in `production_run_identity_map` together with its canonical
+ProductionRun UUID and immutable input hash. Repeating the same alias and input
+is idempotent; reusing an alias for different input returns HTTP 409 with the
+stable `production_run_identity_conflict` code. Run lookup accepts either the
+legacy alias or the canonical UUID, while responses continue to expose both.
+
 `data/workspace` is owned by the ArtifactStore. Domain payloads reference files
 with `workspace://` URIs and `sha256:` hashes, never physical paths. A commit is
 written and flushed to a same-directory temporary file, verified, atomically
