@@ -45,7 +45,7 @@
 
 - `ProductionEvent.run_id/work_item_id/attempt_id/sequence/timestamp` 必填；`request_id` 仅用于适配器调用关联。
 - `artifact_created` 和 `operation_succeeded` 必须包含已验证 `artifact_refs`，百分比不能代替成功证据。
-- `ApiError` 是标准错误对象；现有 `{ok:false,error:{...}}` wrapper 将在后续 API 组合层显式映射。
+- `ApiError/1.0` 是标准错误对象；当前 HTTP 默认继续返回兼容的 `{ok:false,error:{...}}` wrapper，只有显式协商才返回标准对象。待前端和所有调用方完成迁移后，再单独评估是否切换默认响应。
 
 本合同包只使用 Python 标准库，没有新增运行时或分发依赖。
 
