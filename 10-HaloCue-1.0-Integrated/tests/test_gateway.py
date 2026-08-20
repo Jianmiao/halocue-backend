@@ -23,6 +23,7 @@ for source_root in (
 
 from halocue_integrated.gateway import MAX_PROXY_BODY_BYTES, create_gateway, route_request
 from halocue_integrated.server import IntegratedRuntime
+from halocue_production.contracts import validate_contract
 
 
 def _isolate_optional_local_assets(monkeypatch, tmp_path):
@@ -158,7 +159,11 @@ def test_script_release_crosses_the_real_writing_production_boundary(
             work["id"], {"expected_version": release_review["work"]["version"]}
         )
         handoff = writing.handoff_release(frozen["release_id"])
+        repeated = writing.handoff_release(frozen["release_id"])
         production = runtime.production_service.run_detail(handoff["production_run_id"])
+        formal_request = runtime.production_service.formal_inputs.load_request(
+            handoff["production_request_id"]
+        )
     finally:
         runtime.writing_server.shutdown()
         runtime.writing_server.server_close()
@@ -170,10 +175,17 @@ def test_script_release_crosses_the_real_writing_production_boundary(
         runtime.gateway.server_close()
 
     origin = production["run"]["source_summary"]["upstream_release"]
-    assert origin["release_id"] == frozen["release_id"]
-    assert origin["work_id"] == work["id"]
+    assert handoff["contract"] == "ProductionRequest/1.1"
+    assert repeated["idempotent"] is True
+    assert repeated["formal_release_id"] == handoff["formal_release_id"]
+    assert origin["release_id"] == handoff["formal_release_id"]
+    assert origin["work_id"] != work["id"]
     assert origin["writing_pack_version"] == frozen["manifest"]["writing_pack_version"]
     assert production["run"]["release_id"] != frozen["release_id"]
+    assert formal_request["schema_version"] == "1.1"
+    assert formal_request["request_id"] == handoff["production_request_id"]
+    assert formal_request["script_release"]["id"] == handoff["formal_release_id"]
+    validate_contract("ProductionRequest", formal_request)
 
 
 def test_integrated_runtime_lifecycle_and_internal_endpoint_redaction(tmp_path, monkeypatch):

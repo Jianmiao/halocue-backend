@@ -8,9 +8,13 @@ merge the writing and AA production domain implementations.
 - `/production/` serves the AA production workbench from `08-HaloCue-1.0`.
 - `/production/api/v1/*` serves the AA production API.
 
-The browser receives one origin. The writing service still hands off only an
-immutable `ScriptRelease`; production owns its own frozen source copy and
-`ProductionRun`.
+The browser receives one origin. The writing service hands off an immutable
+`ScriptRelease`. In the integrated composition root, the handoff publishes a
+formal `ScriptRelease/1.1`, an initial `AssetManifest/1.0`, and a
+`ProductionRequest/1.1` into the shared local ArtifactStore before creating the
+production run. A standalone writing service without that injected store keeps
+the `WritingHandoff/1.0` compatibility path. Production owns its own frozen
+source copy and `ProductionRun`.
 
 The writing document is the single application page. Selecting AA production
 mounts the production workbench into that document without navigating to a

@@ -56,6 +56,15 @@
 - 正式可运行入口只接受完整 `ProductionRequest/1.1` 和 `ScriptRelease/1.1`；缺少字段时结构化拒绝，不从标题、文件名或数组位置推导。
 - 未来转换层必须保留两种合同身份和原始哈希，不就地覆盖兼容记录。
 
+## B5 正式纵向链路
+
+集成组合层已将写作侧的前缀 ID 以稳定 UUID 投影到正式边界，并按固定 URI
+原子登记正文、`ScriptRelease/1.1` 清单和初始空白 `AssetManifest/1.0`。随后提交
+`ProductionRequest/1.1`；制作侧重新读取并校验三份文件后才创建
+`ProductionRun`。写作数据库仍保留原始 Work/Revision/Release 身份，制作端不会
+回写这些对象。未配置共享 ArtifactStore 的独立写作服务继续使用兼容交接，避免
+把未登记的 URI 冒充正式输入。
+
 ## ProductionRequest 1.1 运行时入口
 
 产品决定采用显式引用方案，不冻结隐式目录布局：
