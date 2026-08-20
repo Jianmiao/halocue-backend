@@ -13,7 +13,7 @@ from pathlib import Path
 from .errors import DomainError
 
 
-WRITING_SCHEMA_VERSION = 2
+WRITING_SCHEMA_VERSION = 3
 
 
 def now() -> str:
@@ -280,6 +280,17 @@ class Repository:
                         connection.execute("PRAGMA user_version = 2")
                     except (sqlite3.DatabaseError, OSError) as exc:
                         raise self._migration_error(2, exc) from exc
+                    current = 2
+                if current < 3:
+                    try:
+                        self._migrate_formal_handoff_identity_schema(connection)
+                        connection.execute(
+                            "INSERT OR IGNORE INTO writing_schema_migrations(version, applied_at) VALUES(?, ?)",
+                            (3, now()),
+                        )
+                        connection.execute("PRAGMA user_version = 3")
+                    except (sqlite3.DatabaseError, OSError) as exc:
+                        raise self._migration_error(3, exc) from exc
                 check = connection.execute("PRAGMA quick_check").fetchone()
                 if not check or str(check[0]).casefold() != "ok":
                     raise DomainError(
@@ -315,6 +326,120 @@ class Repository:
                 return int(connection.execute("PRAGMA user_version").fetchone()[0])
         except (sqlite3.DatabaseError, OSError) as exc:
             raise self._database_error(exc) from exc
+
+    def get_formal_handoff_identity(self, release_id: str) -> dict | None:
+        """Return the durable formal projection for a writing release."""
+        try:
+            with self.connect() as connection:
+                return self.row(
+                    connection.execute(
+                        "SELECT * FROM formal_handoff_identities WHERE release_id=?",
+                        (release_id,),
+                    ).fetchone()
+                )
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise self._database_error(exc) from exc
+
+    @staticmethod
+    def _save_formal_handoff_identity_connection(
+        connection,
+        *,
+        release_id: str,
+        formal_release_id: str,
+        production_request_id: str,
+        formal_work_id: str,
+        production_run_id: str | None,
+        content_hash: str,
+    ) -> dict:
+        existing = connection.execute(
+            "SELECT * FROM formal_handoff_identities WHERE release_id=?",
+            (release_id,),
+        ).fetchone()
+        expected = {
+            "release_id": release_id,
+            "formal_release_id": formal_release_id,
+            "production_request_id": production_request_id,
+            "formal_work_id": formal_work_id,
+            "content_hash": content_hash,
+        }
+        if existing:
+            existing = dict(existing)
+            for field, value in expected.items():
+                if existing[field] != value:
+                    raise DomainError(
+                        "formal_handoff_identity_conflict",
+                        "正式交接身份映射与已冻结记录不一致。",
+                        status=409,
+                        details={"release_id": release_id, "field": field},
+                    )
+            if production_run_id and existing["production_run_id"] not in (None, production_run_id):
+                raise DomainError(
+                    "formal_handoff_identity_conflict",
+                    "正式交接已绑定其他制作运行，不能静默覆盖。",
+                    status=409,
+                    details={"release_id": release_id, "field": "production_run_id"},
+                )
+            if production_run_id and existing["production_run_id"] is None:
+                connection.execute(
+                    "UPDATE formal_handoff_identities SET production_run_id=?, updated_at=? WHERE release_id=?",
+                    (production_run_id, now(), release_id),
+                )
+                existing["production_run_id"] = production_run_id
+            return existing
+        try:
+            timestamp = now()
+            connection.execute(
+                """
+                INSERT INTO formal_handoff_identities
+                (release_id, formal_release_id, production_request_id, formal_work_id,
+                 production_run_id, content_hash, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    release_id,
+                    formal_release_id,
+                    production_request_id,
+                    formal_work_id,
+                    production_run_id,
+                    content_hash,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DomainError(
+                "formal_handoff_identity_conflict",
+                "正式交接身份映射已被其他版本占用。",
+                status=409,
+                details={"release_id": release_id},
+            ) from exc
+        return dict(
+            connection.execute(
+                "SELECT * FROM formal_handoff_identities WHERE release_id=?",
+                (release_id,),
+            ).fetchone()
+        )
+
+    def save_formal_handoff_identity(
+        self,
+        *,
+        release_id: str,
+        formal_release_id: str,
+        production_request_id: str,
+        formal_work_id: str,
+        production_run_id: str | None,
+        content_hash: str,
+    ) -> dict:
+        with self.transaction() as connection:
+            return self._save_formal_handoff_identity_connection(
+                connection,
+                release_id=release_id,
+                formal_release_id=formal_release_id,
+                production_request_id=production_request_id,
+                formal_work_id=formal_work_id,
+                production_run_id=production_run_id,
+                content_hash=content_hash,
+            )
 
     def _migrate_domain_schema(self, connection):
         """Add durable writing-domain fields without replacing an existing workspace."""
@@ -388,6 +513,27 @@ class Repository:
                         "active", 1, timestamp, timestamp,
                     ),
                 )
+
+    @staticmethod
+    def _migrate_formal_handoff_identity_schema(connection):
+        """Persist the cross-domain UUID projection used by formal handoff."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS formal_handoff_identities (
+              release_id TEXT PRIMARY KEY REFERENCES script_releases(id),
+              formal_release_id TEXT NOT NULL UNIQUE,
+              production_request_id TEXT NOT NULL UNIQUE,
+              formal_work_id TEXT NOT NULL,
+              production_run_id TEXT,
+              content_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_formal_handoff_run ON formal_handoff_identities(production_run_id)"
+        )
 
     def recover_attempts(self):
         timestamp = now()
