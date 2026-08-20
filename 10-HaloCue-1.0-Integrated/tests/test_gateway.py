@@ -36,6 +36,57 @@ def _isolate_optional_local_assets(monkeypatch, tmp_path):
     monkeypatch.delenv("HALOCUE_AA_DATA", raising=False)
 
 
+def _freeze_release_for_handoff(writing):
+    work = writing.create_work({"title": "正式交接恢复测试"})
+    brief = writing.save_brief(
+        work["id"],
+        {
+            "expected_version": work["version"],
+            "idea": "验证正式交接在写作进程退出后仍可恢复",
+            "mode": "bond_short",
+            "characters": ["爱丽丝"],
+        },
+    )
+    blueprint = writing.generate_blueprint(
+        work["id"], {"expected_version": brief["work"]["version"]}
+    )
+    chapter = writing.create_chapter(
+        work["id"],
+        {"expected_version": blueprint["work"]["version"], "title": "第一章"},
+    )
+    scene = writing.create_scene(
+        work["id"],
+        chapter["chapter_id"],
+        {
+            "expected_version": chapter["work"]["version"],
+            "title": "恢复入口",
+            "location": "测试工作区",
+            "goal": "确认交接恢复",
+        },
+    )
+    candidate = writing.generate_scene_candidate(
+        work["id"],
+        scene["scene_id"],
+        {"expected_version": scene["work"]["version"]},
+    )
+    accepted = writing.accept_proposal(
+        work["id"],
+        candidate["proposal_id"],
+        {"expected_version": candidate["work"]["version"]},
+    )
+    scene_review = writing.review_scene(
+        work["id"],
+        scene["scene_id"],
+        {"expected_version": accepted["work"]["version"]},
+    )
+    release_review = writing.review_release(
+        work["id"], {"expected_version": scene_review["work"]["version"]}
+    )
+    return writing.freeze_release(
+        work["id"], {"expected_version": release_review["work"]["version"]}
+    )
+
+
 def test_route_request_keeps_api_domains_separate():
     assert route_request("/api/v1/works") == ("writing", "/api/v1/works")
     assert route_request("/production/api/v1/health") == ("production", "/api/v1/health")
@@ -186,6 +237,48 @@ def test_script_release_crosses_the_real_writing_production_boundary(
     assert formal_request["request_id"] == handoff["production_request_id"]
     assert formal_request["script_release"]["id"] == handoff["formal_release_id"]
     validate_contract("ProductionRequest", formal_request)
+
+
+def test_formal_handoff_recovers_after_writing_process_exit_before_binding(
+    tmp_path, monkeypatch
+):
+    _isolate_optional_local_assets(monkeypatch, tmp_path)
+    writing_data = tmp_path / "writing"
+    production_data = tmp_path / "production"
+    runtime = IntegratedRuntime(
+        host="127.0.0.1",
+        port=0,
+        writing_data_dir=writing_data,
+        production_data_dir=production_data,
+    )
+    runtime.start_upstreams()
+    try:
+        frozen = _freeze_release_for_handoff(runtime.writing_service)
+        first = runtime.writing_service.handoff_release(frozen["release_id"])
+        with runtime.writing_service.repo.transaction() as connection:
+            connection.execute(
+                "UPDATE script_releases SET production_run_id=NULL WHERE id=?",
+                (frozen["release_id"],),
+            )
+    finally:
+        runtime.close()
+
+    restarted = IntegratedRuntime(
+        host="127.0.0.1",
+        port=0,
+        writing_data_dir=writing_data,
+        production_data_dir=production_data,
+    )
+    restarted.start_upstreams()
+    try:
+        recovered = restarted.writing_service.handoff_release(frozen["release_id"])
+        detail = restarted.production_service.run_detail(first["production_run_id"])
+    finally:
+        restarted.close()
+
+    assert recovered["idempotent"] is True
+    assert recovered["production_run_id"] == first["production_run_id"]
+    assert detail["production_request"]["id"] == recovered["production_request_id"]
 
 
 def test_integrated_runtime_lifecycle_and_internal_endpoint_redaction(tmp_path, monkeypatch):
