@@ -24,6 +24,7 @@ for source_root in (
 from halocue_integrated.gateway import MAX_PROXY_BODY_BYTES, create_gateway, route_request
 from halocue_integrated.server import IntegratedRuntime
 from halocue_production.contracts import validate_contract
+from halocue_writing.errors import DomainError
 
 
 def _isolate_optional_local_assets(monkeypatch, tmp_path):
@@ -211,7 +212,20 @@ def test_script_release_crosses_the_real_writing_production_boundary(
         )
         handoff = writing.handoff_release(frozen["release_id"])
         repeated = writing.handoff_release(frozen["release_id"])
+        identity = writing.repo.get_formal_handoff_identity(frozen["release_id"])
+        with pytest.raises(DomainError) as identity_conflict:
+            writing.repo.save_formal_handoff_identity(
+                release_id=frozen["release_id"],
+                formal_release_id=handoff["formal_release_id"],
+                production_request_id=handoff["production_request_id"],
+                formal_work_id=writing._formal_uuid("work", work["id"]),
+                production_run_id=handoff["production_run_id"],
+                content_hash="sha256:" + "0" * 64,
+            )
         production = runtime.production_service.run_detail(handoff["production_run_id"])
+        initial_asset_manifest = runtime.production_service.asset_manifests.payload_for_run(
+            handoff["production_run_id"]
+        )
         formal_request = runtime.production_service.formal_inputs.load_request(
             handoff["production_request_id"]
         )
@@ -229,6 +243,13 @@ def test_script_release_crosses_the_real_writing_production_boundary(
     assert handoff["contract"] == "ProductionRequest/1.1"
     assert repeated["idempotent"] is True
     assert repeated["formal_release_id"] == handoff["formal_release_id"]
+    assert identity["formal_release_id"] == handoff["formal_release_id"]
+    assert identity["production_request_id"] == handoff["production_request_id"]
+    assert identity["production_run_id"] == handoff["production_run_id"]
+    assert identity["content_hash"] == frozen["manifest"]["content_hash"]
+    assert identity_conflict.value.code == "formal_handoff_identity_conflict"
+    assert initial_asset_manifest["schema_version"] == "1.0"
+    assert initial_asset_manifest["assets"] == []
     assert origin["release_id"] == handoff["formal_release_id"]
     assert origin["work_id"] != work["id"]
     assert origin["writing_pack_version"] == frozen["manifest"]["writing_pack_version"]
@@ -272,12 +293,17 @@ def test_formal_handoff_recovers_after_writing_process_exit_before_binding(
     restarted.start_upstreams()
     try:
         recovered = restarted.writing_service.handoff_release(frozen["release_id"])
+        identity = restarted.writing_service.repo.get_formal_handoff_identity(
+            frozen["release_id"]
+        )
         detail = restarted.production_service.run_detail(first["production_run_id"])
     finally:
         restarted.close()
 
     assert recovered["idempotent"] is True
     assert recovered["production_run_id"] == first["production_run_id"]
+    assert identity["production_run_id"] == first["production_run_id"]
+    assert identity["formal_release_id"] == recovered["formal_release_id"]
     assert detail["production_request"]["id"] == recovered["production_request_id"]
 
 

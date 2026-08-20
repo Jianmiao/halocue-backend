@@ -93,16 +93,16 @@ def test_http_contract_and_static_workspace(tmp_path):
 def test_writing_schema_version_migration_restart_and_corruption(tmp_path):
     data_dir = tmp_path / "writing"
     repository = Repository(data_dir)
-    assert repository.schema_version() == 2
+    assert repository.schema_version() == 3
     with sqlite3.connect(repository.db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute(
             "SELECT version FROM writing_schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,)]
+        ).fetchall() == [(1,), (2,), (3,)]
         connection.execute("PRAGMA user_version = 1")
 
     restarted = Repository(data_dir)
-    assert restarted.schema_version() == 2
+    assert restarted.schema_version() == 3
 
     with sqlite3.connect(restarted.db_path) as connection:
         connection.execute("PRAGMA user_version = 99")

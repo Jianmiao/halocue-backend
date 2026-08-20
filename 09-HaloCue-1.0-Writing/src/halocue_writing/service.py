@@ -3011,17 +3011,43 @@ class WritingService:
 
         formal_release_id = self._formal_uuid("release", release_id)
         request_id = self._formal_uuid("production-request", release_id)
-        if release["production_run_id"]:
+        formal_work_id = self._formal_uuid("work", release["work_id"])
+        content = self.repo.read_text(release["content_uri"]).encode("utf-8")
+        if sha256_bytes(content) != release["content_hash"]:
+            raise DomainError(
+                "script_release_hash_mismatch",
+                "写作发布正文与冻结哈希不一致，已拒绝正式交接。",
+                status=409,
+            )
+        identity = self.repo.get_formal_handoff_identity(release_id)
+        if identity or release["production_run_id"]:
+            # Re-validate the persisted projection before using it.  This also
+            # makes a manually altered or stale identity fail closed.
+            self.repo.save_formal_handoff_identity(
+                release_id=release_id,
+                formal_release_id=formal_release_id,
+                production_request_id=request_id,
+                formal_work_id=formal_work_id,
+                production_run_id=release["production_run_id"],
+                content_hash=release["content_hash"],
+            )
+        existing_run_id = release["production_run_id"] or (identity or {}).get("production_run_id")
+        if existing_run_id:
+            if release["production_run_id"] != existing_run_id:
+                with self.repo.transaction() as connection:
+                    connection.execute(
+                        "UPDATE script_releases SET production_run_id=? WHERE id=?",
+                        (existing_run_id, release_id),
+                    )
             return {
                 "release_id": release_id,
-                "production_run_id": release["production_run_id"],
+                "production_run_id": existing_run_id,
                 "idempotent": True,
                 "contract": "ProductionRequest/1.1",
                 "formal_release_id": formal_release_id,
                 "production_request_id": request_id,
             }
 
-        formal_work_id = self._formal_uuid("work", release["work_id"])
         formal_manifest_uri = (
             f"workspace://releases/{formal_release_id}/manifest.json"
         )
@@ -3047,13 +3073,6 @@ class WritingService:
             "released_by": release["released_by"],
             "released_at": release["released_at"],
         }
-        content = self.repo.read_text(release["content_uri"]).encode("utf-8")
-        if sha256_bytes(content) != release["content_hash"]:
-            raise DomainError(
-                "script_release_hash_mismatch",
-                "写作发布正文与冻结哈希不一致，已拒绝正式交接。",
-                status=409,
-            )
         release_bytes = canonical_json(formal_release).encode("utf-8") + b"\n"
         asset_manifest_id = self._formal_uuid("asset-manifest", release_id)
         asset_manifest_uri = f"workspace://assets/{asset_manifest_id}/manifest.json"
@@ -3179,6 +3198,15 @@ class WritingService:
                 details={"response_keys": sorted(result) if isinstance(result, dict) else []},
             )
         with self.repo.transaction() as connection:
+            self.repo._save_formal_handoff_identity_connection(
+                connection,
+                release_id=release_id,
+                formal_release_id=formal_release_id,
+                production_request_id=request_id,
+                formal_work_id=formal_work_id,
+                production_run_id=run_id,
+                content_hash=release["content_hash"],
+            )
             connection.execute(
                 "UPDATE script_releases SET production_run_id=? WHERE id=?",
                 (run_id, release_id),
