@@ -193,6 +193,33 @@ def test_service_keeps_legacy_adapter_and_routes_formal_targets(settings):
     service.jobs.close()
 
 
+def test_failed_adapter_validation_is_publicly_retryable():
+    retry_context = {
+        "request_id": "66666666-6666-4666-8666-666666666666",
+        "adapter_id": "storyforge-local",
+        "target": "storyforge_preview",
+        "draft_revision_id": "77777777-7777-4777-8777-777777777777",
+        "input_hashes": {
+            "script_release": "sha256:" + "a" * 64,
+            "performance_draft": "sha256:" + "b" * 64,
+            "asset_manifest": "sha256:" + "c" * 64,
+        },
+    }
+    public = ProductionService._job_public(
+        {
+            "job_id": "job-000000000001",
+            "attempt_id": "88888888-8888-4888-8888-888888888888",
+            "kind": "adapter_validate",
+            "state": "failed",
+            "retry_context": retry_context,
+            "error": {"code": "adapter_validation_failed", "message": "internal"},
+        }
+    )
+
+    assert public["retryable"] is True
+    assert public["next_action"]["stage"] == "review"
+
+
 def test_adapter_job_persists_only_safe_retry_context(settings):
     service = ProductionService(settings)
     request, draft = _formal_context(service)

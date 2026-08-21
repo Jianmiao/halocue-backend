@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import hashlib
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
 from halocue_production.app import create_server
-from halocue_production.contracts import validate_contract
+from halocue_production.contracts import idempotency_key_for_request, validate_contract
 from halocue_production.service import ProductionService
 from test_formal_inputs import formal_request
 from test_service import configured_resource_settings
@@ -55,6 +56,18 @@ def upload(base: str, path: str, filename: str, content: bytes):
         return response.status, dict(response.headers), json.loads(response.read())
 
 
+def wait_for_http_job(base: str, job_id: str, expected_state: str):
+    deadline = time.monotonic() + 5
+    latest = None
+    while time.monotonic() < deadline:
+        status, _, latest = request(base, f"/api/v1/jobs/{job_id}")
+        assert status == 200
+        if latest["job"]["state"] == expected_state:
+            return latest
+        time.sleep(0.01)
+    return latest
+
+
 def test_http_accepts_idempotent_production_request_1_1(settings):
     staging = ProductionService(settings)
     payload = formal_request(staging)
@@ -75,6 +88,147 @@ def test_http_accepts_idempotent_production_request_1_1(settings):
         assert status == 200
         assert repeated["run"]["run_id"] == created["run"]["run_id"]
         assert repeated["handoff"]["idempotent"] is True
+
+
+def test_http_exposes_formal_performance_draft_by_stable_draft_id(settings):
+    staging = ProductionService(settings)
+    payload = formal_request(staging)
+    payload["production_policy"]["target"] = "storyforge_preview"
+    payload["idempotency_key"] = idempotency_key_for_request(payload)
+    staging.jobs.close()
+
+    with api(settings) as base:
+        status, _, created = request(base, "/api/v1/production-runs", payload, "POST")
+        assert status == 201
+        run_id = created["run"]["run_id"]
+
+        status, _, draft_created = request(
+            base, f"/api/v1/production-runs/{run_id}/performance-drafts", {}, "POST"
+        )
+        assert status == 201
+        draft = draft_created["performance_draft"]
+        assert draft["contract"] == "PerformanceDraft/1.0"
+
+        status, _, current = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft['draft_id']}",
+        )
+        assert status == 200
+        assert current["performance_draft"]["draft_id"] == draft["draft_id"]
+        assert current["performance_draft"]["revision_id"] == draft["revision_id"]
+
+
+def test_http_completes_formal_draft_review_render_and_restart(settings):
+    staging = ProductionService(settings)
+    payload = formal_request(staging, text="旁白: 闭环测试\n")
+    payload["production_policy"]["target"] = "storyforge_preview"
+    payload["idempotency_key"] = idempotency_key_for_request(payload)
+    staging.jobs.close()
+
+    with api(settings) as base:
+        status, _, created = request(base, "/api/v1/production-runs", payload, "POST")
+        assert status == 201
+        run_id = created["run"]["run_id"]
+
+        status, _, draft_created = request(
+            base, f"/api/v1/production-runs/{run_id}/performance-drafts", {}, "POST"
+        )
+        assert status == 201
+        draft = draft_created["performance_draft"]
+        draft_id = draft["draft_id"]
+        revision_id = draft["revision_id"]
+        assert draft["review_status"] == "draft"
+        assert str(settings.data_dir) not in json.dumps(draft_created, ensure_ascii=False)
+
+        status, _, revisions = request(
+            base, f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/revisions"
+        )
+        assert status == 200
+        assert revisions["current_revision_id"] == revision_id
+        assert len(revisions["items"]) == 1
+
+        status, _, updated = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}",
+            {"expected_revision_id": revision_id, "patch": {"scenes": draft["payload"]["scenes"]}},
+            "PATCH",
+        )
+        assert status == 200
+        updated_draft = updated["performance_draft"]
+        assert updated_draft["draft_id"] == draft_id
+        assert updated_draft["revision_id"] != revision_id
+        assert updated_draft["review_status"] == "pending_review"
+
+        status, _, conflict = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}",
+            {"expected_revision_id": revision_id, "patch": {"scenes": draft["payload"]["scenes"]}},
+            "PATCH",
+        )
+        assert status == 409
+        assert conflict["error"]["code"] == "performance_draft_revision_conflict"
+
+        status, _, reviewed = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}",
+            {"action": "review", "decision": "approve"},
+            "POST",
+        )
+        assert status == 200
+        approved = reviewed["performance_draft"]
+        assert approved["review_status"] == "approved"
+
+        status, _, unavailable = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/operations",
+            {"operation": "render", "target": "storyforge_video"},
+            "POST",
+        )
+        assert status == 409
+        assert unavailable["error"]["code"] == "adapter_target_unavailable"
+        status, _, unchanged = request(base, f"/api/v1/production-runs/{run_id}")
+        assert status == 200
+        assert unchanged["run"]["state"] == "ready_to_compile"
+
+        status, _, submitted = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/operations",
+            {"operation": "render"},
+            "POST",
+        )
+        assert status == 202
+        job_id = submitted["job"]["job_id"]
+        completed = wait_for_http_job(base, job_id, "succeeded")
+        assert completed["job"]["state"] == "succeeded"
+        bundle = completed["job"]["result"]["bundle_ref"]
+        reader = ProductionService(settings)
+        try:
+            manifest = validate_contract(
+                "BuildBundle",
+                json.loads(
+                    reader.artifacts.read_artifact_bytes(bundle["artifact_uri"]).decode("utf-8")
+                ),
+            )
+        finally:
+            reader.jobs.close()
+        assert manifest["input_hashes"]["script_release"] == payload["script_release"]["content_hash"]
+        assert manifest["input_hashes"]["performance_draft"] == approved["content_hash"]
+        assert manifest["input_hashes"]["asset_manifest"] == payload["asset_manifest"]["content_hash"]
+        assert str(settings.data_dir) not in json.dumps(completed, ensure_ascii=False)
+
+    with api(settings) as base:
+        status, _, restored = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/revisions",
+        )
+        assert status == 200
+        assert restored["current_revision_id"] == approved["revision_id"]
+        assert len(restored["items"]) == 3
+        assert [item["review_status"] for item in restored["items"]] == [
+            "draft",
+            "pending_review",
+            "approved",
+        ]
 
 
 def test_http_exposes_formal_production_adapter_capabilities(settings):
