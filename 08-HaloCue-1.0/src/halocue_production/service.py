@@ -1310,7 +1310,353 @@ class ProductionService:
         production_request = self.formal_inputs.describe_for_run(run_id)
         if production_request is not None:
             result["production_request"] = production_request
+            formal_draft = self._current_formal_draft_for_run(run)
+            if formal_draft is not None:
+                result["performance_draft"] = self._formal_draft_public(formal_draft)
         return result
+
+    @staticmethod
+    def _formal_draft_public(draft: DraftRef) -> dict[str, Any]:
+        value = draft.to_dict()
+        value["contract"] = "PerformanceDraft/1.0"
+        value["payload"] = draft.payload
+        return value
+
+    def _formal_request_for_run(self, run: ProductionRun) -> dict[str, Any]:
+        summary = run.source_summary.get("production_request")
+        if not isinstance(summary, dict) or not summary.get("request_id"):
+            raise ProductionError(
+                "formal_performance_draft_unavailable",
+                "当前制作任务不是正式 ProductionRequest，不能使用标准 PerformanceDraft 门面。",
+                status=409,
+                details={"run_id": run.run_id},
+            )
+        request = self.formal_inputs.load_request(str(summary["request_id"]))
+        if request["request_id"] != summary["request_id"]:
+            raise ProductionError(
+                "production_request_binding_corrupt",
+                "制作任务的正式请求绑定已发生变化。",
+                status=500,
+                details={"run_id": run.run_id},
+            )
+        return request
+
+    def _current_formal_draft_for_run(self, run: ProductionRun) -> DraftRef | None:
+        if not run.production_run_id:
+            return None
+        records = self.repository.runtime.list_formal_performance_drafts_for_run(
+            run.production_run_id
+        )
+        if not records:
+            return None
+        return self.formal_drafts.current(str(records[-1]["draft_id"]))
+
+    def _formal_draft_for_run(
+        self, run: ProductionRun, revision_id: str | None = None
+    ) -> DraftRef:
+        if not run.production_run_id:
+            raise ProductionError(
+                "production_run_identity_invalid",
+                "制作任务缺少稳定身份，无法读取 PerformanceDraft。",
+                status=500,
+            )
+        records = self.repository.runtime.list_formal_performance_drafts_for_run(
+            run.production_run_id
+        )
+        if not records:
+            raise ProductionError(
+                "performance_draft_not_found",
+                "当前制作任务尚未创建 PerformanceDraft。",
+                status=404,
+                details={"run_id": run.run_id},
+            )
+        normalized_revision = str(revision_id or "").strip()
+        if normalized_revision:
+            record = next(
+                (item for item in records if item["revision_id"] == normalized_revision),
+                None,
+            )
+            if record is None:
+                raise ProductionError(
+                    "performance_draft_not_found",
+                    "指定的 PerformanceDraft Revision 不属于当前制作任务。",
+                    status=404,
+                    details={"revision_id": normalized_revision, "run_id": run.run_id},
+                )
+        else:
+            record = records[-1]
+        return self.formal_drafts.load(str(record["artifact_uri"]))
+
+    def create_formal_performance_draft(
+        self, run_id: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        run = self._run(run_id)
+        request = self._formal_request_for_run(run)
+        adapter_request = self._formal_adapter_request(
+            request,
+            run_id=run.production_run_id,
+        )
+        adapter = self.production_adapters.for_target(adapter_request.target)
+        scope = (payload or {}).get("scope") if isinstance(payload, dict) else None
+        if scope is not None and not isinstance(scope, dict):
+            raise ProductionError(
+                "performance_draft_scope_invalid",
+                "PerformanceDraft scope 必须是对象。",
+                status=400,
+            )
+        result = adapter.create_performance_draft(adapter_request, scope)
+        if result.draft_ref is None:
+            raise ProductionError(
+                "performance_draft_creation_failed",
+                "适配器没有返回 PerformanceDraft。",
+                status=502,
+                details={"adapter_id": adapter.capabilities()["adapter_id"]},
+            )
+        run.state = "waiting_for_review"
+        run.current_stage = "performance_draft"
+        run.updated_at = utc_now()
+        self.repository.save_run(run)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "adapter_id": adapter.capabilities()["adapter_id"],
+            "performance_draft": self._formal_draft_public(result.draft_ref),
+        }
+
+    def formal_performance_draft(
+        self, run_id: str, revision_id: str | None = None
+    ) -> dict[str, Any]:
+        run = self._run(run_id)
+        draft = self._formal_draft_for_run(run, revision_id)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "performance_draft": self._formal_draft_public(draft),
+        }
+
+    def formal_performance_draft_revisions(self, run_id: str) -> dict[str, Any]:
+        run = self._run(run_id)
+        if not run.production_run_id:
+            raise ProductionError(
+                "production_run_identity_invalid",
+                "制作任务缺少稳定身份，无法读取 PerformanceDraft 历史。",
+                status=500,
+            )
+        records = self.repository.runtime.list_formal_performance_drafts_for_run(
+            run.production_run_id
+        )
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "current_revision_id": records[-1]["revision_id"] if records else None,
+            "items": [
+                {
+                    "draft_id": item["draft_id"],
+                    "revision_id": item["revision_id"],
+                    "artifact_uri": item["artifact_uri"],
+                    "content_hash": item["content_hash"],
+                    "review_status": item["review_status"],
+                    "parent_revision_id": item["parent_revision_id"],
+                    "adapter_id": item["adapter_id"],
+                    "created_at": item["created_at"],
+                }
+                for item in records
+            ],
+        }
+
+    def update_formal_performance_draft(
+        self, run_id: str, payload: dict[str, Any], draft_id: str | None = None
+    ) -> dict[str, Any]:
+        run = self._run(run_id)
+        expected = str(payload.get("expected_revision_id") or "").strip()
+        patch = payload.get("patch")
+        if not expected:
+            raise ProductionError(
+                "expected_revision_required",
+                "必须提供 expected_revision_id。",
+                status=400,
+            )
+        if not isinstance(patch, dict) or not patch:
+            raise ProductionError(
+                "performance_draft_patch_invalid",
+                "PerformanceDraft patch 必须是非空对象。",
+                status=400,
+            )
+        if "review_status" in patch:
+            raise ProductionError(
+                "performance_draft_review_required",
+                "审查状态只能通过 review 门面修改。",
+                status=409,
+            )
+        patch = dict(patch)
+        patch["review_status"] = "pending_review"
+        draft = self._formal_draft_for_run(run, expected)
+        if draft_id and draft.draft_id != str(draft_id):
+            raise ProductionError(
+                "performance_draft_not_found",
+                "PerformanceDraft 不属于当前制作任务。",
+                status=404,
+                details={"draft_id": str(draft_id), "run_id": run_id},
+            )
+        updated = self.formal_drafts.update(
+            draft,
+            patch,
+            expected_revision_id=expected,
+            run_id=run.production_run_id,
+        )
+        run.state = "waiting_for_review"
+        run.current_stage = "performance_draft"
+        run.updated_at = utc_now()
+        self.repository.save_run(run)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "performance_draft": self._formal_draft_public(updated),
+        }
+
+    def _validate_formal_performance_draft_now(
+        self, run_id: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        run = self._run(run_id)
+        revision_id = (payload or {}).get("revision_id") if isinstance(payload, dict) else None
+        draft = self._formal_draft_for_run(run, revision_id)
+        request = self._formal_request_for_run(run)
+        target = str((payload or {}).get("target") or request["production_policy"]["target"])
+        adapter = self.production_adapters.for_target(target)
+        adapter_request = self._formal_adapter_request(
+            request,
+            target=request["production_policy"]["target"],
+            run_id=run.production_run_id,
+        )
+        result = adapter.validate(adapter_request, draft)
+        diagnostics = [dict(item) for item in result.diagnostics]
+        blockers = [
+            item for item in diagnostics
+            if str(item.get("severity") or "").casefold() in {"error", "blocking"}
+        ]
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "revision_id": draft.revision_id,
+            "adapter_id": adapter.capabilities()["adapter_id"],
+            "valid": not blockers,
+            "diagnostics": diagnostics,
+        }
+
+    def submit_formal_performance_validation(
+        self, run_id: str, payload: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        run = self._run(run_id)
+        draft = self._formal_draft_for_run(
+            run,
+            (payload or {}).get("revision_id") if isinstance(payload, dict) else None,
+        )
+        request = self._formal_request_for_run(run)
+        adapter_request = self._formal_adapter_request(
+            request,
+            run_id=run.production_run_id,
+        )
+        return self.submit_adapter_operation(
+            adapter_request,
+            draft,
+            operation="validate",
+            options={"target": adapter_request.target},
+            legacy_run_id=run_id,
+        )
+
+    def review_formal_performance_draft(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        run = self._run(run_id)
+        revision_id = str(payload.get("revision_id") or "").strip()
+        decision = str(payload.get("decision") or "").strip().casefold()
+        if decision not in {"approve", "reject"}:
+            raise ProductionError(
+                "performance_draft_review_invalid",
+                "decision 必须是 approve 或 reject。",
+                status=400,
+            )
+        draft = self._formal_draft_for_run(run, revision_id)
+        if decision == "approve":
+            validation = self._validate_formal_performance_draft_now(
+                run_id, {"revision_id": draft.revision_id}
+            )
+            if not validation["valid"]:
+                raise ProductionError(
+                    "performance_draft_review_blocked",
+                    "PerformanceDraft 仍有阻塞诊断，不能通过审查。",
+                    status=409,
+                    details={"revision_id": draft.revision_id, "diagnostics": validation["diagnostics"]},
+                )
+        updated = self.formal_drafts.update(
+            draft,
+            {"review_status": "approved" if decision == "approve" else "rejected"},
+            expected_revision_id=draft.revision_id,
+            run_id=run.production_run_id,
+        )
+        run.state = "ready_to_compile" if decision == "approve" else "waiting_for_review"
+        run.current_stage = "performance_draft_review"
+        run.updated_at = utc_now()
+        self.repository.save_run(run)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "decision": decision,
+            "performance_draft": self._formal_draft_public(updated),
+        }
+
+    def submit_formal_performance_operation(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        run = self._run(run_id)
+        operation = str(payload.get("operation") or "").strip().casefold()
+        if operation not in {"compile", "render"}:
+            raise ProductionError(
+                "adapter_operation_invalid",
+                "operation 必须是 compile 或 render。",
+                status=400,
+            )
+        draft = self._formal_draft_for_run(run, payload.get("revision_id"))
+        if draft.review_status != "approved":
+            raise ProductionError(
+                "performance_draft_review_required",
+                "PerformanceDraft 必须通过人工审查后才能编译或渲染。",
+                status=409,
+                details={"revision_id": draft.revision_id, "review_status": draft.review_status},
+            )
+        validation = self._validate_formal_performance_draft_now(
+            run_id,
+            {
+                "revision_id": draft.revision_id,
+                "target": payload.get("target"),
+            },
+        )
+        if not validation["valid"]:
+            raise ProductionError(
+                "performance_draft_validation_failed",
+                "PerformanceDraft 校验未通过，不能提交适配器任务。",
+                status=409,
+                details={"revision_id": draft.revision_id, "diagnostics": validation["diagnostics"]},
+            )
+        request = self._formal_request_for_run(run)
+        adapter_request = self._formal_adapter_request(
+            request,
+            run_id=run.production_run_id,
+        )
+        options = dict(payload)
+        options.pop("operation", None)
+        options.pop("revision_id", None)
+        run.state = "rendering" if operation == "render" else "compiling"
+        run.current_stage = operation
+        run.updated_at = utc_now()
+        self.repository.save_run(run)
+        return self.submit_adapter_operation(
+            adapter_request,
+            draft,
+            operation=operation,
+            options=options,
+            legacy_run_id=run_id,
+        )
 
     def performance_preview(self, run_id: str) -> dict[str, Any]:
         """Build a read-only, task-local representation for the draft preview.
@@ -2021,11 +2367,12 @@ class ProductionService:
         operation: str,
         options: Mapping[str, Any] | None = None,
         work_item_id: str | None = None,
+        legacy_run_id: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
-        if operation not in {"compile", "render"}:
+        if operation not in {"validate", "compile", "render"}:
             raise ProductionError(
                 "adapter_operation_invalid",
-                "正式适配器任务只支持 compile 或 render",
+                "正式适配器任务只支持 validate、compile 或 render",
                 status=400,
                 details={"operation": operation},
             )
@@ -2070,12 +2417,14 @@ class ProductionService:
                 cancellation_probe=token.is_cancelled,
             )
             token.raise_if_cancelled()
-            if operation == "compile":
+            if operation == "validate":
+                result = adapter.validate(adapter_request, draft_ref)
+            elif operation == "compile":
                 result = adapter.compile(adapter_request, draft_ref)
             else:
                 result = adapter.render(adapter_request, draft_ref, safe_options)
             token.raise_if_cancelled()
-            return self._adapter_result_payload(
+            payload = self._adapter_result_payload(
                 result,
                 request=adapter_request,
                 draft_ref=draft_ref,
@@ -2083,15 +2432,41 @@ class ProductionService:
                 target=target,
                 cancelled=token.raise_if_cancelled,
             )
+            return JobOutcome(payload, lambda: commit_success(payload))
+
+        def commit_success(result: dict[str, Any]) -> None:
+            if not legacy_run_id or operation == "validate":
+                return
+            latest = self._run(legacy_run_id)
+            bundle = result.get("bundle_ref") if isinstance(result, dict) else None
+            if isinstance(bundle, dict):
+                latest.last_build_id = str(bundle.get("bundle_id") or "") or None
+            latest.pending_build_id = None
+            latest.state = "compiled" if operation == "compile" else "rendered"
+            latest.current_stage = operation
+            latest.updated_at = utc_now()
+            self.repository.save_run(latest)
+
+        def commit_failure(_exc: Exception) -> None:
+            if not legacy_run_id or operation == "validate":
+                return
+            latest = self._run(legacy_run_id)
+            latest.pending_build_id = None
+            latest.state = "compile_failed" if operation == "compile" else "render_failed"
+            latest.current_stage = operation
+            latest.updated_at = utc_now()
+            self.repository.save_run(latest)
 
         model = adapter.capabilities()
         job = self.jobs.submit(
             f"adapter_{operation}",
             work,
+            run_id=legacy_run_id,
             retry_context=retry_context,
             work_item_id=work_item_id or request.work_item_id,
             provider=str(model["engine_id"]),
             model_or_engine=str(model["engine_version"]),
+            on_failure=commit_failure,
             on_cancel=cancel_adapter,
         )
         return 202, {"ok": True, "job": self._job_public(job.to_dict())}
@@ -2106,7 +2481,7 @@ class ProductionService:
         job = self.jobs.get(job_id)
         if not job:
             raise ProductionError("job_not_found", "后台任务不存在", status=404)
-        if job.kind in {"adapter_compile", "adapter_render"} and job.attempt_id:
+        if job.kind in {"adapter_validate", "adapter_compile", "adapter_render"} and job.attempt_id:
             context = job.retry_context if isinstance(job.retry_context, dict) else {}
             adapter_id = str(context.get("adapter_id") or "").strip()
             if adapter_id:
@@ -2118,10 +2493,15 @@ class ProductionService:
                 status=409,
                 details={"state": job.state},
             )
-        if job.run_id and job.kind in {"compile", "direction_generation"}:
+        if job.run_id and job.kind in {
+            "compile",
+            "direction_generation",
+            "adapter_compile",
+            "adapter_render",
+        }:
             run = self._run(job.run_id)
             run.state = "cancelled"
-            if job.kind == "compile":
+            if job.kind in {"compile", "adapter_compile", "adapter_render"}:
                 run.pending_build_id = None
             run.updated_at = utc_now()
             self.repository.save_run(run)
@@ -2144,7 +2524,7 @@ class ProductionService:
         context = job.retry_context if isinstance(job.retry_context, dict) else {}
         kind = job.kind
         run_id = job.run_id
-        if kind in {"adapter_compile", "adapter_render"}:
+        if kind in {"adapter_validate", "adapter_compile", "adapter_render"}:
             required = {
                 "request_id",
                 "adapter_id",
@@ -2189,9 +2569,16 @@ class ProductionService:
             _, response = self.submit_adapter_operation(
                 request,
                 draft,
-                operation="compile" if kind == "adapter_compile" else "render",
+                operation=(
+                    "validate"
+                    if kind == "adapter_validate"
+                    else "compile"
+                    if kind == "adapter_compile"
+                    else "render"
+                ),
                 options={"target": str(context["target"])},
                 work_item_id=job.work_item_id,
+                legacy_run_id=job.run_id,
             )
         elif kind == "model_connection_test":
             _, response = self.test_direction_model(work_item_id=job.work_item_id)
@@ -2261,7 +2648,7 @@ class ProductionService:
             kind == "model_connection_test"
             or (kind == "ai_preflight" and bool(job.get("run_id")))
             or (
-                kind in {"adapter_compile", "adapter_render"}
+                kind in {"adapter_validate", "adapter_compile", "adapter_render"}
                 and set(retry_context)
                 == {
                     "request_id",
@@ -2287,6 +2674,7 @@ class ProductionService:
             "ai_preflight": "AI 初审（只读建议）",
             "model_connection_test": "测试演出模型连接",
             "cg_advice": "生成 CG 制作意见",
+            "adapter_validate": "适配器校验",
             "adapter_compile": "适配器编译",
             "adapter_render": "适配器渲染",
         }.get(kind, kind or "后台任务")
@@ -2295,7 +2683,7 @@ class ProductionService:
         elif state == "cancelled":
             next_action = {"label": "已取消", "detail": "已阻止该次任务提交结果。", "stage": None}
         elif state in {"failed", "abandoned", "interrupted"}:
-            stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation", "adapter_compile", "adapter_render"} else None
+            stage = "mapping" if kind == "ai_preflight" else "review" if kind in {"compile", "direction_generation", "adapter_validate", "adapter_compile", "adapter_render"} else None
             next_action = {
                 "label": "查看失败原因并回到任务处理",
                 "detail": "修正问题后，从对应步骤重新提交；系统不会自动覆盖现有草稿。",

@@ -1078,6 +1078,25 @@ class RuntimeStore:
         finally:
             connection.close()
 
+    def list_formal_performance_drafts_for_run(
+        self, production_run_id: str
+    ) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM formal_performance_drafts
+                WHERE run_id=?
+                ORDER BY created_at, rowid
+                """,
+                (production_run_id,),
+            ).fetchall()
+            return [self._formal_performance_draft_payload(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
     @staticmethod
     def _asset_manifest_payload(row: sqlite3.Row) -> dict[str, Any]:
         return {
