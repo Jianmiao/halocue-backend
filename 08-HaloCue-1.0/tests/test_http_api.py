@@ -200,6 +200,10 @@ def test_http_completes_formal_draft_review_render_and_restart(settings):
         job_id = submitted["job"]["job_id"]
         completed = wait_for_http_job(base, job_id, "succeeded")
         assert completed["job"]["state"] == "succeeded"
+        status, _, rendered_run = request(base, f"/api/v1/production-runs/{run_id}")
+        assert status == 200
+        assert rendered_run["run"]["state"] == "rendered"
+        assert rendered_run["run"]["runtime_status"] == "succeeded"
         bundle = completed["job"]["result"]["bundle_ref"]
         reader = ProductionService(settings)
         try:

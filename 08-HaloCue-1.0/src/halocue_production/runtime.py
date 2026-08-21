@@ -383,17 +383,18 @@ def legacy_work_item_uuid(production_run_id: str, key: str) -> str:
 
 
 def _runtime_status(legacy_state: str) -> str:
-    if legacy_state in {"generating_direction", "compiling"}:
+    if legacy_state in {"generating_direction", "compiling", "rendering"}:
         return "running"
     if legacy_state in {"waiting_for_review", "ready_to_compile"}:
         return "waiting_user"
-    if legacy_state in {"compiled", "installed"}:
+    if legacy_state in {"compiled", "rendered", "installed"}:
         return "succeeded"
     if legacy_state in {
         "direction_failed",
         "compile_failed",
         "direction_interrupted",
         "compile_interrupted",
+        "render_failed",
     }:
         return "blocked"
     if legacy_state == "cancelled":
