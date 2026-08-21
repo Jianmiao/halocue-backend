@@ -16,6 +16,10 @@ RUN_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)$")
 RUN_PREFLIGHT_SUMMARY_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/preflight-summary$")
 RUN_AI_PREFLIGHTS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/ai-preflights$")
 RUN_PERFORMANCE_PREVIEW_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/performance-preview$")
+RUN_PERFORMANCE_DRAFTS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/performance-drafts$")
+RUN_PERFORMANCE_DRAFT_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/performance-drafts/([^/]+)$")
+RUN_PERFORMANCE_DRAFT_REVISIONS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/performance-drafts/([^/]+)/revisions$")
+RUN_PERFORMANCE_DRAFT_OPERATION_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/performance-drafts/([^/]+)/operations$")
 RUN_DIRECTION_PROPOSALS_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/direction-proposals$")
 RUN_DIRECTION_PROPOSAL_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/direction-proposals/(prop-[0-9A-Za-z-]+)$")
 RUN_CG_ADVICE_ROUTE = re.compile(r"^/api/v1/production-runs/([^/]+)/cg-advice$")
@@ -228,6 +232,80 @@ class ProductionHandler(BaseHTTPRequestHandler):
         match = RUN_PERFORMANCE_PREVIEW_ROUTE.fullmatch(path)
         if match and method == "GET":
             return 200, self.service.performance_preview(match.group(1))
+        match = RUN_PERFORMANCE_DRAFTS_ROUTE.fullmatch(path)
+        if match:
+            if method == "GET":
+                return 200, self.service.formal_performance_draft_revisions(match.group(1))
+            if method == "POST":
+                return 201, self.service.create_formal_performance_draft(
+                    match.group(1), self._body()
+                )
+        match = RUN_PERFORMANCE_DRAFT_REVISIONS_ROUTE.fullmatch(path)
+        if match and method == "GET":
+            return 200, self.service.formal_performance_draft_revisions(match.group(1))
+        match = RUN_PERFORMANCE_DRAFT_OPERATION_ROUTE.fullmatch(path)
+        if match and method == "POST":
+            payload = self._body()
+            current = self.service.formal_performance_draft(match.group(1))
+            if current["performance_draft"]["draft_id"] != match.group(2):
+                raise ProductionError(
+                    "performance_draft_not_found",
+                    "PerformanceDraft 不属于当前制作任务。",
+                    status=404,
+                )
+            payload["revision_id"] = payload.get("revision_id") or current[
+                "performance_draft"
+            ]["revision_id"]
+            return self.service.submit_formal_performance_operation(
+                match.group(1), payload
+            )
+        match = RUN_PERFORMANCE_DRAFT_ROUTE.fullmatch(path)
+        if match:
+            run_id, draft_id = match.groups()
+            if method == "GET":
+                current = self.service.formal_performance_draft(run_id)
+                if current["performance_draft"]["draft_id"] != draft_id:
+                    raise ProductionError(
+                        "performance_draft_not_found",
+                        "PerformanceDraft 不属于当前制作任务。",
+                        status=404,
+                        details={"draft_id": draft_id, "run_id": run_id},
+                    )
+                return 200, current
+            if method == "PATCH":
+                payload = self._body()
+                return 200, self.service.update_formal_performance_draft(
+                    run_id, payload, draft_id
+                )
+        match = RUN_PERFORMANCE_DRAFT_ROUTE.fullmatch(path)
+        if match and method == "POST":
+            run_id, draft_id = match.groups()
+            payload = self._body()
+            if payload.get("action") == "review":
+                current = self.service.formal_performance_draft(run_id)
+                if current["performance_draft"]["draft_id"] != draft_id:
+                    raise ProductionError(
+                        "performance_draft_not_found",
+                        "PerformanceDraft 不属于当前制作任务。",
+                        status=404,
+                    )
+                payload["revision_id"] = payload.get("revision_id") or current[
+                    "performance_draft"
+                ]["revision_id"]
+                result = self.service.review_formal_performance_draft(run_id, payload)
+                return 200, result
+            if payload.get("action") == "validate":
+                current = self.service.formal_performance_draft(run_id)
+                if current["performance_draft"]["draft_id"] != draft_id:
+                    raise ProductionError(
+                        "performance_draft_not_found",
+                        "PerformanceDraft 不属于当前制作任务。",
+                        status=404,
+                    )
+                payload["revision_id"] = payload.get("revision_id") or current[
+                    "performance_draft"
+                ]["revision_id"]
+                return self.service.submit_formal_performance_validation(run_id, payload)
         match = RUN_DIRECTION_PROPOSALS_ROUTE.fullmatch(path)
         if match and method == "GET":
             return 200, self.service.direction_proposals(match.group(1))

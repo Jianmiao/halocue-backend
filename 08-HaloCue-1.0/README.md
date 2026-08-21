@@ -283,6 +283,27 @@ return suggested categories and target conflict state without exposing AA
 workspace paths. `install-check` accepts `category`, `story_name`, and an
 optional `build_id`; it does not write to AA.
 
+Formal `ProductionRequest/1.1` runs also expose the versioned standard
+`PerformanceDraft/1.0` lifecycle:
+
+```text
+GET   /api/v1/production-runs/{run_id}/performance-drafts
+POST  /api/v1/production-runs/{run_id}/performance-drafts
+GET   /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}
+PATCH /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}
+GET   /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/revisions
+POST  /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}
+POST  /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/operations
+```
+
+The `draft_id` is stable across immutable revisions. Updates require
+`expected_revision_id` and create a successor revision; review decisions are
+submitted with `{"action":"review","decision":"approve|reject"}`. Only an
+approved revision can submit `render` or `compile`. Each adapter operation is
+persisted as a JobAttempt and a successful render/compile publishes a verified
+`BuildBundle/1.0` whose input hashes bind the ScriptRelease, PerformanceDraft,
+and AssetManifest.
+
 ## Generation modes
 
 `format_only` preserves the submitted script and performs deterministic

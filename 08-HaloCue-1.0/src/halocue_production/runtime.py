@@ -383,17 +383,18 @@ def legacy_work_item_uuid(production_run_id: str, key: str) -> str:
 
 
 def _runtime_status(legacy_state: str) -> str:
-    if legacy_state in {"generating_direction", "compiling"}:
+    if legacy_state in {"generating_direction", "compiling", "rendering"}:
         return "running"
     if legacy_state in {"waiting_for_review", "ready_to_compile"}:
         return "waiting_user"
-    if legacy_state in {"compiled", "installed"}:
+    if legacy_state in {"compiled", "rendered", "installed"}:
         return "succeeded"
     if legacy_state in {
         "direction_failed",
         "compile_failed",
         "direction_interrupted",
         "compile_interrupted",
+        "render_failed",
     }:
         return "blocked"
     if legacy_state == "cancelled":
@@ -1071,6 +1072,25 @@ class RuntimeStore:
                 ORDER BY rowid
                 """,
                 (draft_id,),
+            ).fetchall()
+            return [self._formal_performance_draft_payload(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise self._database_error(exc) from exc
+        finally:
+            connection.close()
+
+    def list_formal_performance_drafts_for_run(
+        self, production_run_id: str
+    ) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM formal_performance_drafts
+                WHERE run_id=?
+                ORDER BY created_at, rowid
+                """,
+                (production_run_id,),
             ).fetchall()
             return [self._formal_performance_draft_payload(row) for row in rows]
         except sqlite3.DatabaseError as exc:
