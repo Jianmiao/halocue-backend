@@ -2,5 +2,6 @@
 
 from .adapter import StoryForgeAdapter
 from .renderer import StoryForgeRenderer
+from .video import FfmpegVideoExporter
 
-__all__ = ["StoryForgeAdapter", "StoryForgeRenderer"]
+__all__ = ["FfmpegVideoExporter", "StoryForgeAdapter", "StoryForgeRenderer"]

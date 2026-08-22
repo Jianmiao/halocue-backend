@@ -9,7 +9,9 @@ from halocue_production.config import Settings
 
 
 @pytest.fixture
-def settings(tmp_path: Path) -> Settings:
+def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+    # Keep the suite independent from an optional developer-machine FFmpeg.
+    monkeypatch.setenv("HALOCUE_FFMPEG", str(tmp_path / "missing-ffmpeg"))
     project_root = Path(__file__).resolve().parents[1]
     workspace_root = project_root.parent
     legacy_root = Path(
@@ -27,4 +29,3 @@ def settings(tmp_path: Path) -> Settings:
     )
     value.prepare()
     return value
-

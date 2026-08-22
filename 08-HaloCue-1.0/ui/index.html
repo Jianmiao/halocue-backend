@@ -164,6 +164,7 @@
             <span data-review-step="3"><b>4</b><em>通过后编译</em></span>
           </div>
         </section>
+        <section id="formalProductionPanel" class="formal-production-panel hidden" aria-live="polite"></section>
         <div class="review-layout">
           <div class="review-column"><div class="filterbar"><button class="active" data-filter="all">全部</button><button data-filter="pending">待审</button><button data-filter="blocking">待处理</button><button data-filter="direction">演出</button></div><div id="cardList" class="card-list"></div></div>
           <aside class="inspector"><small>当前决定</small><h3 id="inspectorTitle">选择一张卡片</h3><div id="inspectorBody"><p>在左侧选择卡片后，可编辑内容或处理素材请求。</p></div></aside>
@@ -187,6 +188,14 @@
   <dialog id="performancePreviewDialog"><section class="dialog-shell performance-preview-dialog"><header><div><small>草稿演出预览</small><h3>按当前草稿检查观看顺序</h3><p>这是只读预览：它不会写入草稿、不会调用 AI，也不等同于最终 AA 渲染。最终效果以编译后的 AA 工程为准。</p></div><button class="icon-button" data-close-dialog="performancePreviewDialog" aria-label="关闭">×</button></header><div id="performancePreview" class="performance-preview-empty"><strong>正在读取当前草稿</strong><p>预览会使用本任务冻结的背景、CG 和角色映射。</p></div><footer class="dialog-footer performance-preview-footer"><span id="performancePreviewStatus">未做任何修改。</span><div><button type="button" id="previewPrevious">上一张</button><button type="button" id="previewNext">下一张</button><button type="button" class="primary" id="previewOpenCard">回到这张卡修改</button></div></footer></section></dialog>
   <dialog id="directionProposalsDialog"><section class="dialog-shell direction-proposals-dialog"><header><div><small>AI 演出建议 · 只读记录</small><h3>先看模型做了什么，再逐卡确认</h3><p>这里列出 AI 生成时提出的表情、情绪、动作和画面效果。它不会在这里直接修改草稿；需要调整时，请回到逐卡审查器处理对应台词。</p></div><button class="icon-button" data-close-dialog="directionProposalsDialog" aria-label="关闭">×</button></header><div id="directionProposals" class="direction-proposals-empty"><strong>正在读取 AI 演出记录</strong><p>不会写入草稿，也不会重新调用模型。</p></div><footer class="dialog-footer"><span id="directionProposalsStatus">未做任何修改。</span><button type="button" class="primary" data-close-dialog="directionProposalsDialog">回到逐卡审查</button></footer></section></dialog>
   <div class="toast" id="toast" role="status"></div>
+  <style>
+    .formal-production-panel{margin:0 0 18px;padding:16px;background:#fff;border:1px solid #b9d1c4;box-shadow:0 4px 14px rgba(34,57,45,.06)}
+    .formal-production-panel header{display:flex;justify-content:space-between;gap:15px;align-items:start}
+    .formal-production-panel h4{margin:4px 0;font-size:16px}.formal-production-panel p{margin:5px 0;color:var(--muted);font-size:12px}.formal-production-panel small{color:var(--muted)}
+    .formal-production-panel .formal-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0}.formal-production-panel .formal-meta article{padding:9px;background:#f5f8f5;border:1px solid #dbe7df}.formal-production-panel .formal-meta strong{display:block;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .formal-production-panel .formal-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.formal-production-panel label{display:grid;gap:5px;color:var(--muted);font-size:12px}.formal-production-panel select{min-width:190px;padding:8px;border:1px solid #cbd2cd;background:#fff;font:inherit;color:var(--ink)}
+    .formal-production-panel .formal-history{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;overflow:auto}.formal-production-panel .formal-history button{white-space:nowrap;font-size:12px}.formal-production-panel .formal-history button.active{background:var(--green);border-color:var(--green);color:#fff}.formal-production-panel .formal-error{border-left:3px solid var(--danger);padding-left:10px;color:var(--danger)}
+  </style>
   <script src="app.js"></script>
 </body>
 </html>

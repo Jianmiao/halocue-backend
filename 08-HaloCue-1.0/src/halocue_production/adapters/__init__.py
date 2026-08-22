@@ -15,7 +15,7 @@ from .drafts import (
     StandardDraftStore,
 )
 from .aa import AzureArchiveAdapter
-from .storyforge import StoryForgeAdapter, StoryForgeRenderer
+from .storyforge import FfmpegVideoExporter, StoryForgeAdapter, StoryForgeRenderer
 from .bundles import BuildBundleAssembler, DeliverableInput
 
 __all__ = [
@@ -30,6 +30,7 @@ __all__ = [
     "PerformanceDraftStore",
     "StandardDraftStore",
     "AzureArchiveAdapter",
+    "FfmpegVideoExporter",
     "StoryForgeAdapter",
     "StoryForgeRenderer",
     "BuildBundleAssembler",

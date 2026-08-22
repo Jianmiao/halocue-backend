@@ -143,6 +143,10 @@ def test_integrated_runtime_serves_both_workbenches_and_apis(tmp_path, monkeypat
     assert "halocue-production" in production_health
     assert 'const API_ROOT = "/production/api/v1";' in production_js
     assert 'const API_ROOT = "/production/api/v1";' in embedded_production_js
+    assert 'id="formalProductionPanel"' in production_html
+    assert 'performance-drafts' in production_js
+    assert 'expected_revision_id' in production_js
+    assert 'storyforge_video' in production_js
     assert 'const productionRoot = productionHost?.shadowRoot;' in embedded_production_js
     assert 'productionRoot.addEventListener("click"' in embedded_production_js
     assert 'document.addEventListener("click"' not in embedded_production_js
