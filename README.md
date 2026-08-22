@@ -13,7 +13,8 @@ HaloCue 1.0 的本地优先后端仓库。当前采用模块化单体，包含�
 
 ## 当前实现状态
 
-后端正式制作纵向链路已经在功能分支完成并验证：
+后端正式制作纵向链路已经完成并验证。这里的“闭环”指不依赖真实 AA
+安装、真实模型密钥或不可分发素材的本地自动化链路：
 
 ```text
 ScriptRelease/1.1
@@ -31,7 +32,14 @@ ScriptRelease/1.1
 BuildBundle 对 ScriptRelease、PerformanceDraft 和 AssetManifest 的输入哈希绑定。
 具体请求路径和示例见 [`08-HaloCue-1.0/README.md`](08-HaloCue-1.0/README.md)。
 
-正式制作闭环已经推送到公开远程；是否已合并到 `main` 以 GitHub PR 页面为准。
+当前闭环代码已推送到公开远程分支
+`codex/halocue-production-loop`。分支推送不等于合并到 `main`；合并状态以
+GitHub PR 页面为准。
+
+闭环验收范围：写作发布、制作请求、持久运行、标准演出草稿、人工审查、StoryForge
+预览/可选视频导出、AA 兼容编译边界和不可变 `BuildBundle` 均由合同、SQLite
+状态和 Artifact 哈希串联。真实 AA 编译/安装仍属于用户本机的手动或 integration
+验收，不作为公开仓库的自动化前提。
 
 ## 产品定位
 
@@ -209,7 +217,9 @@ Set-Location ..\10-HaloCue-1.0-Integrated
 python -m pytest -q
 ```
 
-当前正式制作闭环分支的验证结果为：制作域 `260 passed`、写作域 `58 passed`、集成域 `6 passed`。八份正式合同的冻结规则见 `08-HaloCue-1.0/contracts/README.md`。
+本轮完整验证结果为：制作域 `268 passed`、写作域 `58 passed`、集成域
+`6 passed`。八份正式合同的冻结规则见
+`08-HaloCue-1.0/contracts/README.md`。
 
 ## 集成边界
 
@@ -220,11 +230,13 @@ python -m pytest -q
 - StoryForge 只作为制作适配器和预览/渲染引擎，不拥有 Work、Revision 或 ScriptRelease。
 - AA 保持 local-only；仓库不上传 AA 源码、数据库、素材或安装目录。
 
-## 已知未完成项
+## 运行前提与兼容策略
 
-- AA 真实安装和编译验证需要用户本机已授权的 AA 环境，自动化测试使用 fixture，不依赖真实安装。
-- StoryForge 视频导出器是可选能力；未配置时能力发现会明确返回缺失能力，不伪装成可用。
-- UI 尚未替代后端合同；前端应按正式 API 和 `AdapterCapabilities/1.0` 接入。
+- AA 真实安装和编译需要用户本机已授权的 AA 环境；自动化测试使用 fixture，不把真实安装作为公开仓库的运行前提。
+- StoryForge 视频导出是按本机 exporter 能力启用的可选目标；未配置时能力发现会明确报告不可用，不伪装成成功。
+- 正式工作台已经接入 `PerformanceDraft`、审查、校验、预览/视频任务和 Job 轮询；视觉样式可以独立演进，不改变后端合同。
+- 1.0 使用稳定 UUID 投影和空白 `AssetManifest` 作为默认跨域策略；若未来更换写作侧原生 ID 或默认素材选择，应通过新合同版本迁移，不影响当前闭环。
+- `ApiError/1.0` 通过显式协商返回，默认兼容错误 wrapper 是当前版本的有意兼容策略。
 
 ## 开发约束
 

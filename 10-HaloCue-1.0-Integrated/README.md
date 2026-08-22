@@ -47,9 +47,11 @@ stable domain error instead of silently rebuilding the workspace.
 
 ## Current model boundary
 
-The writing Provider is still the visibly labelled Fake Provider. This
-integration does not claim that real model calls, token accounting, automatic
-canon maintenance, or a distributable `ba-writing` WritingPack are complete.
+The writing Provider is the visibly labelled Fake Provider in the repository
+fixtures. This is an intentional deterministic local boundary for the 1.0
+backend loop; real provider calls, token accounting, automatic canon maintenance,
+and a distributable `ba-writing` WritingPack are separate provider/product
+extensions and are not required for the production handoff or BuildBundle path.
 
 HTTP compatibility remains explicit: both domain handlers and the Gateway
 return the legacy error wrapper by default. A client must send
