@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from .app import create_server
 from .config import Settings
@@ -9,12 +10,17 @@ from .service import ProductionService
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="HaloCue 1.0 production backend")
+    parser.add_argument("command", nargs="?", choices=("serve", "aa-preflight"), default="serve")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--data-dir", default=None)
     args = parser.parse_args(argv)
     settings = Settings.from_env(host=args.host, port=args.port, data_dir=args.data_dir)
     service = ProductionService(settings)
+    if args.command == "aa-preflight":
+        print(json.dumps(service.aa_workspace_preflight(), ensure_ascii=False, indent=2))
+        service.jobs.close()
+        return
     server = create_server(service, settings.host, settings.port)
     print(f"HaloCue production API: http://{settings.host}:{server.server_port}/api/v1/health")
     try:
@@ -28,4 +34,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

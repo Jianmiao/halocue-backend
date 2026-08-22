@@ -338,6 +338,9 @@ class StoryForgeAdapter(AdapterBase):
                 "adapter_capability_unavailable",
                 "storyforge_render_options_invalid",
                 "video_artifact_invalid",
+                "video_export_options_invalid",
+                "video_export_failed",
+                "video_export_output_missing",
             }:
                 return exc
             return ProductionError(

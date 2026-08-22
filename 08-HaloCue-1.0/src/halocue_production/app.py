@@ -203,6 +203,8 @@ class ProductionHandler(BaseHTTPRequestHandler):
                 return 200, self.service.aa_workspace_settings()
             if method == "POST":
                 return 200, self.service.configure_aa_workspace(self._body())
+        if path == "/api/v1/settings/aa-workspace/preflight" and method == "GET":
+            return 200, self.service.aa_workspace_preflight()
         if path == "/api/v1/settings/aa-environment":
             if method == "GET":
                 return 200, self.service.inspect_aa_environment()

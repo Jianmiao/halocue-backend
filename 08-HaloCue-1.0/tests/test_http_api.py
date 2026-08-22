@@ -81,7 +81,6 @@ def test_http_accepts_idempotent_production_request_1_1(settings):
         assert created["production_request"]["version"] == "1.1"
         assert created["handoff"]["idempotent"] is False
         assert str(settings.data_dir) not in json.dumps(created, ensure_ascii=False)
-
         status, _, repeated = request(
             base, "/api/v1/production-runs", payload, "POST"
         )
@@ -89,6 +88,19 @@ def test_http_accepts_idempotent_production_request_1_1(settings):
         assert repeated["run"]["run_id"] == created["run"]["run_id"]
         assert repeated["handoff"]["idempotent"] is True
 
+
+def test_http_aa_workspace_preflight_is_read_only_and_sanitized(settings):
+    with api(settings) as base:
+        status, _, result = request(base, "/api/v1/settings/aa-workspace/preflight")
+
+    assert status == 200
+    assert result["kind"] == "aa_workspace_preflight"
+    assert result["local_only"] is True
+    assert result["status"] == "not_ready"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert str(settings.data_dir) not in serialized
+    assert str(settings.legacy_root) not in serialized
+    assert "path" not in serialized
 
 def test_http_exposes_formal_performance_draft_by_stable_draft_id(settings):
     staging = ProductionService(settings)
@@ -233,6 +245,53 @@ def test_http_completes_formal_draft_review_render_and_restart(settings):
             "pending_review",
             "approved",
         ]
+
+
+def test_http_storyforge_video_uses_optional_ffmpeg_and_binds_build_inputs(settings, tmp_path, monkeypatch):
+    fake = tmp_path / "fake_ffmpeg.py"
+    fake.write_text(
+        "import pathlib, sys\npathlib.Path(sys.argv[-1]).write_bytes(b'video-http-fixture')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HALOCUE_FFMPEG", str(fake))
+    staging = ProductionService(settings)
+    payload = formal_request(staging, text="旁白: 视频闭环\n")
+    payload["production_policy"]["target"] = "storyforge_preview"
+    payload["idempotency_key"] = idempotency_key_for_request(payload)
+    staging.jobs.close()
+
+    with api(settings) as base:
+        status, _, created = request(base, "/api/v1/production-runs", payload, "POST")
+        assert status == 201
+        run_id = created["run"]["run_id"]
+        status, _, draft_created = request(
+            base, f"/api/v1/production-runs/{run_id}/performance-drafts", {}, "POST"
+        )
+        assert status == 201
+        draft = draft_created["performance_draft"]
+        draft_id = draft["draft_id"]
+        status, _, reviewed = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}",
+            {"action": "review", "decision": "approve"},
+            "POST",
+        )
+        assert status == 200
+        approved = reviewed["performance_draft"]
+        status, _, submitted = request(
+            base,
+            f"/api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/operations",
+            {"operation": "render", "target": "storyforge_video"},
+            "POST",
+        )
+        assert status == 202
+        completed = wait_for_http_job(base, submitted["job"]["job_id"], "succeeded")
+
+    bundle = completed["job"]["result"]["bundle_ref"]
+    assert bundle["target"] == "storyforge_video"
+    assert bundle["artifact_uri"].startswith("artifact://build-bundles/")
+    assert completed["job"]["result"]["artifact_refs"]
+    assert str(settings.data_dir) not in json.dumps(completed, ensure_ascii=False)
 
 
 def test_http_exposes_formal_production_adapter_capabilities(settings):

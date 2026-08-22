@@ -28,6 +28,11 @@
     sourceFileName: null,
     upstreamRelease: null,
     aaEnvironment: null,
+    formalRequest: null,
+    formalDraft: null,
+    formalRevisions: null,
+    formalCapabilities: null,
+    formalBusy: false,
   };
   const API_ROOT = location.port === "8891"
     ? "http://127.0.0.1:8892/api/v1"
@@ -316,6 +321,7 @@
     state.currentRun = result.run;
     state.currentDraft = result.draft;
     state.gates = result.gates;
+    await loadFormalProduction(result);
     state.selectedCard = state.currentDraft?.cards?.find((card) => card.card_id === state.selectedCard?.card_id) || null;
     await loadTaskPreflight();
     updateShell();
@@ -335,10 +341,142 @@
     } catch (error) { handleError(error); }
   }
 
+  function isFormalRun() {
+    return state.formalRequest?.contract_kind === "ProductionRequest/1.1"
+      || state.currentRun?.source_summary?.production_request?.contract_kind === "ProductionRequest/1.1";
+  }
+
+  function formalPath(suffix = "") {
+    return `/production-runs/${encodeURIComponent(state.currentRun.run_id)}/performance-drafts${suffix}`;
+  }
+
+  async function loadFormalProduction(detail = null) {
+    const panel = $("#formalProductionPanel");
+    const summary = state.currentRun?.source_summary?.production_request;
+    const formal = summary?.contract_kind === "ProductionRequest/1.1" || detail?.production_request?.version === "1.1";
+    const candidate = formal ? { ...(summary || {}), ...(detail?.production_request || {}), contract_kind: "ProductionRequest/1.1" } : null;
+    state.formalRequest = candidate;
+    if (!state.currentRun || !candidate || candidate.contract_kind !== "ProductionRequest/1.1") {
+      state.formalDraft = null;
+      state.formalRevisions = null;
+      if (panel) panel.classList.add("hidden");
+      return;
+    }
+    state.formalRequest = candidate;
+    state.formalDraft = detail?.performance_draft || null;
+    try {
+      if (!state.formalCapabilities) {
+        const capabilities = await api("/production-adapters");
+        state.formalCapabilities = capabilities.adapters || [];
+      }
+      state.formalRevisions = await api(formalPath());
+      if (detail?.performance_draft) state.formalDraft = detail.performance_draft;
+      const first = state.formalRevisions.items?.[state.formalRevisions.items.length - 1];
+      if (!state.formalDraft && first?.draft_id) {
+        const current = await api(formalPath(`/${encodeURIComponent(first.draft_id)}`));
+        state.formalDraft = current.performance_draft;
+      }
+    } catch (error) {
+      state.formalDraft = null;
+      state.formalRevisions = { items: [], error: error.message || "正式草稿读取失败" };
+    }
+    renderFormalProduction();
+  }
+
+  function formalTargets() {
+    const formalTargetLabels = { storyforge_preview: "StoryForge 预览", storyforge_video: "StoryForge 视频" };
+    const targets = [];
+    (state.formalCapabilities || []).forEach((adapter) => {
+      (adapter.targets || []).forEach((target) => {
+        if (!targets.some((item) => item.target === target)) {
+          targets.push({ target, label: formalTargetLabels[target] || target, available: true, adapter: adapter.adapter_id });
+        }
+      });
+    });
+    return targets;
+  }
+
+  function renderFormalProduction() {
+    const panel = $("#formalProductionPanel");
+    if (!panel || !isFormalRun()) return;
+    panel.classList.remove("hidden");
+    const draft = state.formalDraft;
+    const revisions = state.formalRevisions?.items || [];
+    if (!draft) {
+      panel.innerHTML = `<header><div><small>正式制作合同 · ProductionRequest/1.1</small><h4>创建标准 PerformanceDraft</h4><p>${esc(state.formalRevisions?.error || "当前任务尚未建立正式演出草稿。")}</p></div><button type="button" class="primary" id="createFormalDraft">创建正式草稿</button></header>`;
+      $("#createFormalDraft")?.addEventListener("click", createFormalDraft);
+      return;
+    }
+    const targets = formalTargets();
+    const selectedTarget = state.currentRun?.source_summary?.production_request?.target || targets[0]?.target || "storyforge_preview";
+    const targetOptions = targets.length
+      ? targets.map((item) => `<option value="${esc(item.target)}" ${item.target === selectedTarget ? "selected" : ""}>${esc(item.label)} · ${esc(item.adapter)}</option>`).join("")
+      : `<option value="${esc(selectedTarget)}">${esc(selectedTarget)} · 当前请求</option>`;
+    const approved = draft.review_status === "approved";
+    const revisionButtons = revisions.map((item) => `<button type="button" class="${item.revision_id === draft.revision_id ? "active" : ""}" disabled title="${esc(item.content_hash)}">${esc(item.revision_id)} · ${esc(item.review_status)}</button>`).join("");
+    panel.innerHTML = `<header><div><small>正式制作合同 · ProductionRequest/1.1</small><h4>PerformanceDraft/1.0 · ${esc(draft.review_status)}</h4><p>当前 Revision ${esc(draft.revision_id)} · 内容哈希 ${esc(draft.content_hash)}</p></div><span class="mode-badge">${approved ? "已批准" : "需要审查"}</span></header><div class="formal-meta"><article><small>Draft ID</small><strong title="${esc(draft.draft_id)}">${esc(draft.draft_id)}</strong></article><article><small>当前 Revision</small><strong title="${esc(draft.revision_id)}">${esc(draft.revision_id)}</strong></article><article><small>来源</small><strong>${esc(draft.adapter_id || "production adapter")}</strong></article></div><div class="formal-actions"><label>渲染目标<select id="formalRenderTarget">${targetOptions}</select></label><button type="button" id="formalRefresh">刷新正式草稿</button><button type="button" id="formalUpdate" ${state.formalBusy ? "disabled" : ""}>提交当前 Revision</button><button type="button" id="formalValidate" ${state.formalBusy ? "disabled" : ""}>正式校验</button><button type="button" class="primary" id="formalApprove" ${approved || state.formalBusy ? "disabled" : ""}>批准正式草稿</button><button type="button" class="primary" id="formalRender" ${!approved || state.formalBusy ? "disabled" : ""}>提交渲染任务</button></div><div class="formal-history"><small>Revision 历史</small>${revisionButtons || "<span class=empty>暂无历史</span>"}</div>`;
+    $("#formalRefresh")?.addEventListener("click", () => refreshCurrentRun().catch(handleError));
+    $("#formalUpdate")?.addEventListener("click", updateFormalDraft);
+    $("#formalValidate")?.addEventListener("click", validateFormalDraft);
+    $("#formalApprove")?.addEventListener("click", approveFormalDraft);
+    $("#formalRender")?.addEventListener("click", renderFormalDraft);
+  }
+
+  async function createFormalDraft() {
+    if (!state.currentRun || state.formalBusy) return;
+    state.formalBusy = true;
+    try {
+      await api(formalPath(), { method: "POST", body: JSON.stringify({}) });
+      await refreshCurrentRun();
+      toast("正式 PerformanceDraft 已创建。");
+    } catch (error) { handleError(error); } finally { state.formalBusy = false; renderFormalProduction(); }
+  }
+
+  async function updateFormalDraft() {
+    if (!state.currentRun || !state.formalDraft || state.formalBusy) return;
+    state.formalBusy = true;
+    try {
+      const payload = { expected_revision_id: state.formalDraft.revision_id, patch: { scenes: state.formalDraft.payload?.scenes || [] } };
+      await api(formalPath(`/${encodeURIComponent(state.formalDraft.draft_id)}`), { method: "PATCH", body: JSON.stringify(payload) });
+      await refreshCurrentRun();
+      toast("正式草稿已生成新 Revision，等待审查。");
+    } catch (error) { handleError(error); } finally { state.formalBusy = false; renderFormalProduction(); }
+  }
+
+  async function approveFormalDraft() {
+    if (!state.currentRun || !state.formalDraft || state.formalBusy) return;
+    state.formalBusy = true;
+    try {
+      await api(formalPath(`/${encodeURIComponent(state.formalDraft.draft_id)}`), { method: "POST", body: JSON.stringify({ action: "review", decision: "approve", revision_id: state.formalDraft.revision_id }) });
+      await refreshCurrentRun();
+      toast("正式草稿已批准。");
+    } catch (error) { handleError(error); } finally { state.formalBusy = false; renderFormalProduction(); }
+  }
+
+  async function validateFormalDraft() {
+    if (!state.currentRun || !state.formalDraft || state.formalBusy) return;
+    state.formalBusy = true;
+    try {
+      const result = await api(formalPath(`/${encodeURIComponent(state.formalDraft.draft_id)}/operations`), { method: "POST", body: JSON.stringify({ operation: "validate", revision_id: state.formalDraft.revision_id }) });
+      if (result.job?.job_id) await pollJob(result.job.job_id, "正式草稿校验");
+    } catch (error) { handleError(error); } finally { state.formalBusy = false; renderFormalProduction(); }
+  }
+
+  async function renderFormalDraft() {
+    if (!state.currentRun || !state.formalDraft || state.formalBusy) return;
+    state.formalBusy = true;
+    try {
+      const target = $("#formalRenderTarget")?.value || "storyforge_preview";
+      const result = await api(formalPath(`/${encodeURIComponent(state.formalDraft.draft_id)}/operations`), { method: "POST", body: JSON.stringify({ operation: "render", target, revision_id: state.formalDraft.revision_id }) });
+      if (result.job?.job_id) await pollJob(result.job.job_id, `正式渲染 · ${target}`);
+    } catch (error) { handleError(error); } finally { state.formalBusy = false; renderFormalProduction(); }
+  }
+
   async function openRun(runId) {
     try {
       const result = await api(`/production-runs/${encodeURIComponent(runId)}`);
       state.currentRun = result.run; state.currentDraft = result.draft; state.gates = result.gates;
+      await loadFormalProduction(result);
       await loadTaskPreflight();
       updateShell();
       const next = result.draft?.review_ready ? "review" : "mapping";
@@ -369,6 +507,7 @@
     try {
       const result = await api("/production-runs", { method: "POST", body: JSON.stringify(payload) });
       state.currentRun = result.run; state.currentDraft = result.draft; state.gates = result.gates;
+      await loadFormalProduction(result);
       await loadTaskPreflight();
       updateShell(); await loadRuns(); showStage("mapping", { force: true });
       toast("制作任务已建立，开始确认角色映射。");
@@ -1839,6 +1978,7 @@
       state.currentRun = result.run;
       state.currentDraft = result.draft;
       state.gates = result.gates;
+      await loadFormalProduction(result);
       await loadTaskPreflight();
       $("#tasksDialog").close();
       updateShell();

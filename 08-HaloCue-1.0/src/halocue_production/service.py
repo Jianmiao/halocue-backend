@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import ArtifactStore
+from .aa_environment import AaEnvironmentPreflight
 from .asset_manifests import AssetManifestStore
 from .contracts import canonical_json_bytes, contract_content_hash, sha256_bytes
 from .config import Settings
@@ -43,6 +44,7 @@ from .adapters import (
     StoryForgeAdapter,
     StoryForgeRenderer,
 )
+from .adapters.storyforge.video import FfmpegVideoExporter
 
 
 INVALID_PROJECT = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -113,6 +115,14 @@ class ProductionService:
                 StoryForgeAdapter(
                     StoryForgeRenderer(self.artifacts),
                     self.formal_drafts,
+                    video_exporter=(
+                        FfmpegVideoExporter(
+                            self.artifacts,
+                            staging_root=self.settings.data_dir,
+                        )
+                        if FfmpegVideoExporter.available()
+                        else None
+                    ),
                 ),
             ]
         )
@@ -481,6 +491,14 @@ class ProductionService:
             },
             "capabilities": self.capabilities(),
         }
+
+    def aa_workspace_preflight(self) -> dict[str, Any]:
+        """Run a read-only local AA acceptance check with a sanitized result."""
+        try:
+            environment = self.adapter.discover_aa_environment()
+        except Exception:
+            environment = {}
+        return AaEnvironmentPreflight(self.settings, environment=environment).run()
 
     @staticmethod
     def _aa_environment_public(environment: dict[str, Any]) -> dict[str, Any]:

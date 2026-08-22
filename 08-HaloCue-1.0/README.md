@@ -175,6 +175,7 @@ GET  /api/v1/capabilities
 GET  /api/v1/production-adapters
 GET  /api/v1/settings/aa-workspace
 POST /api/v1/settings/aa-workspace
+GET  /api/v1/settings/aa-workspace/preflight
 ```
 
 `GET /api/v1/production-adapters` returns the normalized
@@ -198,6 +199,19 @@ The settings request is `{"path":"E:\\AzureArchive\\...\\data"}`. A valid
 workspace must contain `projects`, `saves`, `overrides`, and `settings`.
 The selected path is persisted only in `08-HaloCue-1.0/data/settings.json`.
 
+The read-only `aa-workspace/preflight` endpoint is the local acceptance check
+for AA. It reports required-directory state, resource-index availability and
+hash status, executable/install discovery flags, and stable diagnostics. It
+never returns a physical path, AA project name, database row, or resource
+content. The same result can be printed without starting HTTP with
+`halocue-production aa-preflight --data-dir <local-data-dir>`. AA remains
+local-only and is never uploaded by this repository.
+
+If `HALOCUE_RESOURCE_INDEX_SHA256` is set, the preflight verifies that hash.
+Otherwise it uses a sibling `<resource-index>.sha256` sidecar when present;
+without either reference the index is reported as `unverified` rather than
+silently treated as verified.
+
 ### Production runs
 
 ```text
@@ -213,6 +227,25 @@ POST /api/v1/production-runs/{run_id}/compile
 POST /api/v1/production-runs/{run_id}/install
 GET  /api/v1/jobs/{job_id}
 ```
+
+Formal runs expose the standard draft and adapter boundary in addition to the
+legacy card routes:
+
+```text
+GET   /api/v1/production-runs/{run_id}/performance-drafts
+POST  /api/v1/production-runs/{run_id}/performance-drafts
+GET   /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}
+PATCH /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}
+POST  /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}
+POST  /api/v1/production-runs/{run_id}/performance-drafts/{draft_id}/operations
+```
+
+The workbench shows this surface only for a `ProductionRequest/1.1` run. Draft
+updates require `expected_revision_id`; review approval is a separate action;
+render and compile create persisted jobs and return only stable Artifact and
+BuildBundle references. A StoryForge installation may advertise
+`storyforge_preview` and, when FFmpeg is available, `storyforge_video`. FFmpeg
+is optional and discovered from `HALOCUE_FFMPEG` or `PATH`.
 
 Every run has an immutable `AssetManifest/1.0`. Registering a task-local custom
 asset does not silently mutate that manifest. The explicit manifest upgrade
